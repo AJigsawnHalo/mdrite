@@ -157,6 +157,80 @@ int menu_open = -1;
 int menu_sel  = 0;
 int menu_col[MENU_COUNT];
 
+/* ================= selection (raw document coordinates) ================= */
+
+/* A selection is an anchor position plus the live cursor position
+ * (cur_line/cur_col) -- both are raw Markdown buffer coordinates
+ * (a line index and a column index into doc[line]->text), never
+ * screen coordinates. Because of that, the same sel_active/anchor
+ * pair is valid and renders correctly in both Raw and Writer view
+ * with no translation when the view is toggled with F2. */
+int sel_active   = 0;
+int anchor_line  = 0, anchor_col = 0;
+
+void sel_clear(void) { sel_active = 0; }
+
+/* Starts a selection anchored at the current cursor position, if one
+ * isn't already active. Safe to call on every Shift-held movement --
+ * only the first call in an unbroken run of Shift-moves actually
+ * sets the anchor; later calls in the same run are no-ops. */
+void sel_begin(void)
+{
+    if (!sel_active) {
+        anchor_line = cur_line;
+        anchor_col  = cur_col;
+        sel_active  = 1;
+    }
+}
+
+/* Normalizes the anchor/cursor pair into an ordered (start <= end)
+ * pair, comparing by line first and then column. */
+void sel_bounds(int *sl, int *sc, int *el, int *ec)
+{
+    if (anchor_line < cur_line || (anchor_line == cur_line && anchor_col <= cur_col)) {
+        *sl = anchor_line; *sc = anchor_col;
+        *el = cur_line;    *ec = cur_col;
+    } else {
+        *sl = cur_line;    *sc = cur_col;
+        *el = anchor_line; *ec = anchor_col;
+    }
+}
+
+/* Raw [start,end) column range selected on line_no, clipped to
+ * [0, line_len]. Sets *out_start to -1 when line_no isn't touched by
+ * the selection at all -- including when the selection is currently
+ * empty (Shift has been held but the cursor hasn't actually moved
+ * off the anchor yet). Callers treat out_start == -1 as "nothing
+ * selected on this row". */
+void sel_line_range(int line_no, int line_len, int *out_start, int *out_end)
+{
+    int sl, sc, el, ec;
+
+    *out_start = -1;
+    *out_end   = -1;
+    if (!sel_active) return;
+
+    sel_bounds(&sl, &sc, &el, &ec);
+    if (sl == el && sc == ec) return;           /* empty selection */
+    if (line_no < sl || line_no > el) return;    /* line not touched */
+
+    *out_start = (line_no == sl) ? sc : 0;
+    *out_end   = (line_no == el) ? ec : line_len;
+    if (*out_start > line_len) *out_start = line_len;
+    if (*out_end   > line_len) *out_end   = line_len;
+}
+
+/* True if Shift is currently held, checked via the BIOS keyboard
+ * flag byte (bit 0 = right shift, bit 1 = left shift) rather than
+ * from the key code coming back from _KEYBRD_READ. The dedicated
+ * arrow/Home/End/PgUp/PgDn keys report the same scan code whether or
+ * not Shift is down, so the flag byte is the only way to tell a
+ * plain move from a Shift-extend. */
+int shift_down(void)
+{
+    return (_bios_keybrd(_KEYBRD_SHIFTSTATUS) & 0x03) != 0;
+}
+
 /* ================= video primitives ================= */
 
 void put_char(int col, int row, char ch, unsigned char attr)
@@ -217,6 +291,7 @@ void doc_reset(void)
     cur_line = cur_col = top_line = left_col = 0;
     modified = 0;
     undo_line_no = -1;
+    sel_clear();
 }
 
 /* ================= undo ================= */
@@ -236,6 +311,7 @@ void do_undo(void)
         strcpy(status_msg, "Nothing to undo.");
         return;
     }
+    sel_clear();
     strcpy(doc[undo_line_no]->text, undo_line.text);
     doc[undo_line_no]->len = undo_line.len;
     cur_line = undo_line_no;
@@ -252,6 +328,7 @@ void insert_char(int ch)
     Line *l = doc[cur_line];
     int i;
     if (l->len >= MAX_LINE_LEN) { strcpy(status_msg, "Line full."); return; }
+    sel_clear();
     save_undo(cur_line);
     for (i = l->len; i > cur_col; i--) l->text[i] = l->text[i - 1];
     l->text[cur_col] = (char) ch;
@@ -265,6 +342,7 @@ void backspace(void)
 {
     Line *prev, *cur;
     int i;
+    sel_clear();
     if (cur_col > 0) {
         Line *l = doc[cur_line];
         save_undo(cur_line);
@@ -301,6 +379,7 @@ void delete_forward(void)
 {
     Line *l = doc[cur_line];
     int i;
+    sel_clear();
     if (cur_col < l->len) {
         save_undo(cur_line);
         for (i = cur_col; i < l->len - 1; i++) l->text[i] = l->text[i + 1];
@@ -330,6 +409,7 @@ void split_line(void)
     Line *nl;
     int i;
     if (doc_count >= MAX_LINES) { strcpy(status_msg, "Document full."); return; }
+    sel_clear();
     nl = new_line();
     strcpy(nl->text, l->text + cur_col);
     nl->len = l->len - cur_col;
@@ -351,6 +431,7 @@ void split_line(void)
 void delete_current_line(void)
 {
     int i;
+    sel_clear();
     if (doc_count <= 1) {
         doc[0]->text[0] = '\0';
         doc[0]->len = 0;
@@ -417,6 +498,42 @@ void scroll_to_cursor(void)
 
 /* ================= rendering ================= */
 
+/* ---- selection highlight helpers ----
+ *
+ * These are called from inside render_line at the exact point each
+ * visible glyph is emitted, passing the raw buffer column that glyph
+ * came from. That's the "refactor" the Writer renderer needed: every
+ * put_char site now knows and reports the raw source column that
+ * produced it, so highlighting is decided per visible character
+ * against the *raw* selection range -- never by converting selection
+ * endpoints into a screen-column span and painting between them.
+ * Hidden delimiters (the "**" of bold, the "#" of a heading, etc.)
+ * are simply never drawn and never asked about, so they can't shift
+ * or gap the highlight the way a screen-span approach would risk.
+ */
+
+/* True if raw column range [r0, r1) overlaps the row's selected raw
+ * range [sel_start, sel_end). sel_start == -1 means nothing is
+ * selected on this row. */
+int sel_overlaps(int r0, int r1, int sel_start, int sel_end)
+{
+    return sel_start >= 0 && r0 < sel_end && r1 > sel_start;
+}
+
+/* Reverse-video swap: highlights a cell regardless of its current
+ * fg/bg attribute, so selection reads consistently over normal text,
+ * bold/italic/code/strike runs, headings, and blockquotes alike. */
+unsigned char swap_attr(unsigned char attr)
+{
+    return (unsigned char) (((attr & 0x0F) << 4) | ((attr & 0xF0) >> 4));
+}
+
+/* attr, highlighted if the single raw column raw_col is selected. */
+unsigned char apply_sel(unsigned char attr, int raw_col, int sel_start, int sel_end)
+{
+    return sel_overlaps(raw_col, raw_col + 1, sel_start, sel_end) ? swap_attr(attr) : attr;
+}
+
 /* Renders one buffer line into one screen row.
  *
  * Raw/Markdown view: shows the text exactly as typed, honoring
@@ -426,8 +543,12 @@ void scroll_to_cursor(void)
  * horizontal-rule are whole-line markers checked first; everything
  * else (bold/italic/code/strike/link) toggles as it scans left to
  * right. See the file header for what's simplified and why.
+ *
+ * sel_start/sel_end give this row's selected raw column range as
+ * [sel_start, sel_end); sel_start == -1 means no selection touches
+ * this row. Callers get these from sel_line_range().
  */
-void render_line(const char *text, int row, int offset)
+void render_line(const char *text, int row, int offset, int sel_start, int sel_end)
 {
     int i = 0, col = 0, len = strlen(text);
     int bold = 0, italic = 0, code = 0, strike = 0, scr;
@@ -438,7 +559,8 @@ void render_line(const char *text, int row, int offset)
     if (view_mode == 1) {
         for (i = 0; i < len; i++) {
             scr = i - offset;
-            if (scr >= 0 && scr < SCREEN_COLS) put_char(scr, row, text[i], ATTR_NORMAL);
+            if (scr >= 0 && scr < SCREEN_COLS)
+                put_char(scr, row, text[i], apply_sel(ATTR_NORMAL, i, sel_start, sel_end));
         }
         return;
     }
@@ -448,8 +570,11 @@ void render_line(const char *text, int row, int offset)
         int all_dash = 1, ii;
         for (ii = 0; ii < len; ii++) if (text[ii] != '-') { all_dash = 0; break; }
         if (all_dash) {
-            for (col = 0; col < SCREEN_COLS; col++)
-                put_char(col, row, (char) 196, ATTR_NORMAL);  /* CP437 horizontal line */
+            for (col = 0; col < SCREEN_COLS; col++) {
+                attr = (col < len) ? apply_sel(ATTR_NORMAL, col, sel_start, sel_end)
+                                    : ATTR_NORMAL;
+                put_char(col, row, (char) 196, attr);  /* CP437 horizontal line */
+            }
             return;
         }
     }
@@ -459,7 +584,7 @@ void render_line(const char *text, int row, int offset)
         while (i < len && text[i] == '#') i++;
         if (i < len && text[i] == ' ') i++;
         for (; i < len && col < SCREEN_COLS; i++, col++)
-            put_char(col, row, text[i], ATTR_HEAD);
+            put_char(col, row, text[i], apply_sel(ATTR_HEAD, i, sel_start, sel_end));
         return;
     }
 
@@ -468,13 +593,17 @@ void render_line(const char *text, int row, int offset)
         i = 1;
         if (i < len && text[i] == ' ') i++;
         for (; i < len && col < SCREEN_COLS; i++, col++)
-            put_char(col, row, text[i], ATTR_QUOTE);
+            put_char(col, row, text[i], apply_sel(ATTR_QUOTE, i, sel_start, sel_end));
         return;
     }
 
     /* list item: hyphen bullet only (asterisk would collide with italic) */
     if (text[0] == '-' && len > 1 && text[1] == ' ') {
-        put_char(0, row, (char) 7, ATTR_LISTMARK);  /* CP437 bullet glyph */
+        /* the bullet glyph stands in for raw columns 0-1 (the "- "
+         * prefix), so it's checked as a 2-wide range rather than a
+         * single raw column like everything else here */
+        attr = sel_overlaps(0, 2, sel_start, sel_end) ? swap_attr(ATTR_LISTMARK) : ATTR_LISTMARK;
+        put_char(0, row, (char) 7, attr);  /* CP437 bullet glyph */
         col = 1;
         i = 2;
         /* falls through to the inline scanner below for the rest */
@@ -502,7 +631,8 @@ void render_line(const char *text, int row, int offset)
                 if (k < len) {
                     int m;
                     for (m = i + 1; m < j; m++) {
-                        if (col < SCREEN_COLS) put_char(col, row, text[m], ATTR_LINK);
+                        if (col < SCREEN_COLS)
+                            put_char(col, row, text[m], apply_sel(ATTR_LINK, m, sel_start, sel_end));
                         col++;
                     }
                     i = k + 1;
@@ -516,7 +646,7 @@ void render_line(const char *text, int row, int offset)
                  : bold   ? ATTR_BOLD
                  : italic ? ATTR_ITALIC
                  : ATTR_NORMAL;
-            put_char(col, row, text[i], attr);
+            put_char(col, row, text[i], apply_sel(attr, i, sel_start, sel_end));
         }
         i++;
         col++;
@@ -591,20 +721,23 @@ void draw_status_bar(void)
 {
     char buf[SCREEN_COLS + 1];
     int i;
+    const char *sel_tag = sel_active ? " | Sel" : "";
     if (vim_mode)
-        sprintf(buf, " %s%s | Ln %d/%d Col %d | %s | VIM:%s | %s",
+        sprintf(buf, " %s%s | Ln %d/%d Col %d | %s | VIM:%s%s | %s",
                 filename[0] ? filename : "untitled",
                 modified ? "*" : "",
                 cur_line + 1, doc_count, cur_col + 1,
                 view_mode ? "Markdown" : "Writer",
                 vim_insert ? "Insert" : "Normal",
+                sel_tag,
                 status_msg);
     else
-        sprintf(buf, " %s%s | Ln %d/%d Col %d | %s | %s",
+        sprintf(buf, " %s%s | Ln %d/%d Col %d | %s%s | %s",
                 filename[0] ? filename : "untitled",
                 modified ? "*" : "",
                 cur_line + 1, doc_count, cur_col + 1,
                 view_mode ? "Markdown" : "Writer",
+                sel_tag,
                 status_msg);
     buf[SCREEN_COLS] = '\0';
     put_string(0, STATUS_ROW, buf, ATTR_STATUS);
@@ -664,8 +797,13 @@ void redraw_screen(void)
 
     for (r = 0; r < TEXT_ROWS; r++) {
         ln = top_line + r;
-        if (ln < doc_count) render_line(doc[ln]->text, r, left_col);
-        else clear_row(r, ATTR_NORMAL);
+        if (ln < doc_count) {
+            int sel_start, sel_end;
+            sel_line_range(ln, doc[ln]->len, &sel_start, &sel_end);
+            render_line(doc[ln]->text, r, left_col, sel_start, sel_end);
+        } else {
+            clear_row(r, ATTR_NORMAL);
+        }
     }
     draw_status_bar();
     draw_menu_bar();
@@ -743,6 +881,7 @@ void load_file(const char *fname)
     cur_line = cur_col = top_line = left_col = 0;
     modified = 0;
     undo_line_no = -1;
+    sel_clear();
     strcpy(status_msg, "Loaded.");
 }
 
@@ -973,8 +1112,17 @@ int main(int argc, char **argv)
             else vim_pending = 0;   /* unrecognized: swallow, don't insert */
         }
         else if (lo == 27) {
-            if (vim_mode) { vim_insert = 0; vim_pending = 0; }  /* Insert -> Normal */
-            else cmd_quit_request();
+            /* Escape clears an active selection first, before its
+             * usual job (Insert->Normal in vim mode, or quit) --
+             * same key, but selection takes priority when there is
+             * one, same as most editors. */
+            if (sel_active) {
+                sel_clear();
+            } else if (vim_mode) {
+                vim_insert = 0; vim_pending = 0;  /* Insert -> Normal */
+            } else {
+                cmd_quit_request();
+            }
         } else if (lo == 0) {
             matched = 0;
             for (k = 0; k < MENU_COUNT; k++) {
@@ -984,14 +1132,27 @@ int main(int argc, char **argv)
             }
             if (!matched) {
                 switch (hi) {
-                    case 0x4B: move_left();      break;
-                    case 0x4D: move_right();     break;
-                    case 0x48: move_up();        break;
-                    case 0x50: move_down();      break;
-                    case 0x47: move_home();      break;
-                    case 0x4F: move_end();       break;
-                    case 0x49: page_up();        break;
-                    case 0x51: page_down();      break;
+                    case 0x4B: case 0x4D: case 0x48: case 0x50:
+                    case 0x47: case 0x4F: case 0x49: case 0x51: {
+                        /* cursor-movement keys: Shift held extends
+                         * (or starts) the selection; unmodified,
+                         * they clear it -- selection tracks
+                         * cur_line/cur_col, which the move below
+                         * updates as always. */
+                        if (shift_down()) sel_begin();
+                        else sel_clear();
+                        switch (hi) {
+                            case 0x4B: move_left();  break;
+                            case 0x4D: move_right(); break;
+                            case 0x48: move_up();    break;
+                            case 0x50: move_down();  break;
+                            case 0x47: move_home();  break;
+                            case 0x4F: move_end();   break;
+                            case 0x49: page_up();    break;
+                            case 0x51: page_down();  break;
+                        }
+                        break;
+                    }
                     case 0x53: delete_forward(); break;
                     case 0x3C: view_mode = !view_mode; break;  /* F2 */
                     case 0x3D: cmd_find_next();  break;         /* F3 */
