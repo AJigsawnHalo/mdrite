@@ -10,32 +10,46 @@
  *
  * Keys:
  *   Arrows, Home, End, PgUp, PgDn   - move cursor
+ *   Shift + any of the above        - select text (works across
+ *     lines); releasing Shift keeps the selection until you move
+ *     without Shift, type, or press Esc
  *   Enter / Backspace / Del         - edit text
  *   Ctrl+S Save   Ctrl+O Open   Ctrl+N New   Ctrl+A Save As
  *   Ctrl+F Find   F3 Find Next  Ctrl+G Go To Line
  *   Ctrl+Z Undo (last edit only)
+ *   Ctrl+C Copy   Ctrl+X Cut   Ctrl+V Paste
+ *     Cut/Copy need an active selection ("Nothing selected." in the
+ *     status bar otherwise). Paste replaces an active selection if
+ *     there is one, same as everywhere else; plain typing does NOT
+ *     yet replace a selection the same way -- worth knowing until
+ *     that's unified. One clipboard slot, no history.
  *   F2   Toggle Writer view / raw Markdown view
- *   Esc  Quit (confirms if there are unsaved changes)
+ *   F4   Toggle vim-lite keymapping on/off (also under View)
+ *   Alt+X   Quit (confirms if there are unsaved changes) -- moved
+ *     here from Esc to match the WordStar/early-DOS-editor
+ *     convention of Alt+X for eXit
  *   Alt+F / Alt+E / Alt+S / Alt+V  open the File / Edit / Search /
  *     View pull-down menu on the bottom bar. Arrows move within it,
  *     Left/Right switch menus, Enter runs the selected item, Esc
  *     closes it. Every menu item just calls the same function its
  *     shortcut does -- the menu is a second way in, not a separate
  *     code path.
- *   Ctrl+V   Toggle vim-lite keymapping on/off (also under View).
- *     Off by default. When on, starts in Normal sub-mode:
+ *   Vim-lite mode (F4 to toggle, off by default). Starts in Normal
+ *     sub-mode:
  *       h/j/k/l move, 0/$ start/end of line, i insert (before
  *       cursor), a insert (after cursor), x delete char, dd delete
  *       line, u undo, : opens a command line (:w :q :wq :q!).
- *       Esc in Insert sub-mode returns to Normal -- this is the
- *       repurposed key; Esc no longer quits once vim mode is on,
- *       quitting is :q / :q! / :wq only, same as real vim.
- *     Ctrl-shortcuts, Enter, and Backspace keep working the same in
- *     both sub-modes. This is a small, honestly-scoped subset --
- *     no word motions (w/b/e), no visual-mode selection, no yank/
- *     paste registers, no counts ("3dd"), no macros. See "NOT IN
- *     HERE YET" below for the full list of what's still missing,
- *     vim-specific and otherwise.
+ *       Esc in Insert sub-mode returns to Normal.
+ *     Ctrl-shortcuts (including Copy/Cut/Paste), Enter, and
+ *     Backspace keep working the same in both sub-modes. This is a
+ *     small, honestly-scoped subset -- no word motions (w/b/e), no
+ *     vim-style visual-mode selection (Shift+arrows works in vim
+ *     mode too, just not v/V), no yank/paste registers, no counts
+ *     ("3dd"), no macros. See "NOT IN HERE YET" below for the full
+ *     list of what's still missing, vim-specific and otherwise.
+ *   Esc, outside of vim mode and menus: clears an active selection
+ *     if there is one; otherwise it's a no-op now that quitting has
+ *     its own key (Alt+X).
  *
  * MARKDOWN SUPPORTED IN WRITER VIEW:
  *   **bold**   *italic*   `code`   ~~strikethrough~~
@@ -59,9 +73,12 @@
  *     and italic are both "on" at the same spot, only one color
  *     wins (code > strikethrough > bold > italic > normal). Can't
  *     stack colors in 16-color text mode.
- *   - Cut/Copy/Paste, Zoom, true reflowed word-wrap, Replace, and
- *     multi-level undo are still not here -- see the earlier
- *     conversation for why each of those is its own small project.
+ *   - Zoom, true reflowed word-wrap, Replace, and multi-level undo
+ *     are still not here -- see the earlier conversation for why
+ *     each of those is its own small project. A selection deleted
+ *     or replaced across multiple lines also isn't undoable yet,
+ *     for the same single-line-undo reason line splits/merges
+ *     aren't.
  *
  * I don't have a DOS/Watcom environment to test this here, so
  * treat each build like a normal first build of new code.
@@ -147,8 +164,9 @@ typedef struct {
 
 MenuCategory menus[MENU_COUNT] = {
     { "File",   0x21, { "New        ^N", "Open       ^O", "Save       ^S",
-                         "Save As    ^A", "Quit       Esc" }, 5 },
-    { "Edit",   0x12, { "Undo       ^Z" }, 1 },
+                         "Save As    ^A", "Quit       Alt+X" }, 5 },
+    { "Edit",   0x12, { "Undo       ^Z", "Cut        ^X", "Copy       ^C",
+                         "Paste      ^V" }, 4 },
     { "Search", 0x1F, { "Find       ^F", "Find Next  F3", "Go To Line ^G" }, 3 },
     { "View",   0x2F, { "Toggle View F2", "Vim Keys   ^V" }, 2 }
 };
@@ -156,6 +174,14 @@ MenuCategory menus[MENU_COUNT] = {
 int menu_open = -1;
 int menu_sel  = 0;
 int menu_col[MENU_COUNT];
+
+/* ---------- clipboard ---------- */
+/* Flat buffer holding a copy of the selected text, lines joined with
+ * '\n'. Filled by cmd_copy, consumed by cmd_paste -- one clipboard
+ * slot, no history, like every DOS-era editor's clipboard. */
+#define CLIP_MAX 4000
+char clipboard[CLIP_MAX] = "";
+int  clip_len = 0;
 
 /* ================= selection (raw document coordinates) ================= */
 
@@ -322,6 +348,54 @@ void do_undo(void)
 }
 
 /* ================= editing ops ================= */
+
+/* Removes the selected text from the document, single-line or
+ * spanning several. Leaves the cursor at the (now-collapsed)
+ * selection start and clears the selection. Like split_line/
+ * delete_current_line, a multi-line delete is a structural change
+ * the single-line undo can't represent, so it's invalidated rather
+ * than misrepresented. Used directly by cmd_cut, and by cmd_paste
+ * so pasting over an active selection replaces it instead of
+ * inserting into the middle of it. */
+void sel_delete(void)
+{
+    int sl, sc, el, ec, i;
+    if (!sel_active) return;
+    sel_bounds(&sl, &sc, &el, &ec);
+    if (sl == el && sc == ec) { sel_clear(); return; }  /* nothing actually selected */
+
+    if (sl == el) {
+        Line *l = doc[sl];
+        int n = ec - sc;
+        save_undo(sl);
+        for (i = sc; i < l->len - n; i++) l->text[i] = l->text[i + n];
+        l->len -= n;
+        l->text[l->len] = '\0';
+    } else {
+        Line *startl = doc[sl];
+        Line *endl = doc[el];
+        int suffix_len = endl->len - ec;
+        int shift;
+        if (startl->len + suffix_len > MAX_LINE_LEN) {
+            strcpy(status_msg, "Selection too long to delete across lines.");
+            sel_clear();
+            return;
+        }
+        startl->text[sc] = '\0';
+        startl->len = sc;
+        strcat(startl->text, endl->text + ec);
+        startl->len += suffix_len;
+        for (i = sl + 1; i <= el; i++) free(doc[i]);
+        shift = el - sl;
+        for (i = el + 1; i < doc_count; i++) doc[i - shift] = doc[i];
+        doc_count -= shift;
+        undo_line_no = -1;  /* spans lines: not representable by single-line undo */
+    }
+    cur_line = sl;
+    cur_col = sc;
+    sel_clear();
+    modified = 1;
+}
 
 void insert_char(int ch)
 {
@@ -899,6 +973,61 @@ void save_file(const char *fname)
 
 /* ================= commands ================= */
 
+/* Copies the selection into the clipboard buffer, lines joined with
+ * '\n'. Doesn't touch the document or clear the selection -- Copy
+ * is read-only, unlike Cut. */
+void cmd_copy(void)
+{
+    int sl, sc, el, ec, ln, from, to, n;
+    if (!sel_active) { strcpy(status_msg, "Nothing selected."); return; }
+    sel_bounds(&sl, &sc, &el, &ec);
+    if (sl == el && sc == ec) { strcpy(status_msg, "Nothing selected."); return; }
+
+    clip_len = 0;
+    for (ln = sl; ln <= el; ln++) {
+        from = (ln == sl) ? sc : 0;
+        to   = (ln == el) ? ec : doc[ln]->len;
+        if (from > doc[ln]->len) from = doc[ln]->len;
+        if (to   > doc[ln]->len) to   = doc[ln]->len;
+        n = to - from;
+        if (n > 0 && clip_len + n < CLIP_MAX - 1) {
+            memcpy(clipboard + clip_len, doc[ln]->text + from, n);
+            clip_len += n;
+        }
+        if (ln < el && clip_len < CLIP_MAX - 1) clipboard[clip_len++] = '\n';
+    }
+    clipboard[clip_len] = '\0';
+    strcpy(status_msg, "Copied.");
+}
+
+void cmd_cut(void)
+{
+    if (!sel_active) { strcpy(status_msg, "Nothing selected."); return; }
+    cmd_copy();
+    sel_delete();
+    strcpy(status_msg, "Cut.");
+}
+
+/* Inserts the clipboard at the cursor. A selection active at paste
+ * time is replaced rather than typed over -- same convention as
+ * every other editor's paste. Embedded '\n's become real line
+ * splits via split_line(), one clipboard char at a time through
+ * insert_char(), so paste inherits exactly the same MAX_LINE_LEN/
+ * MAX_LINES guards (and the same per-line single-level undo
+ * behavior) as ordinary typing -- no separate bounds-checking to
+ * keep in sync. */
+void cmd_paste(void)
+{
+    int i;
+    if (clip_len == 0) { strcpy(status_msg, "Clipboard empty."); return; }
+    if (sel_active) sel_delete();
+    for (i = 0; i < clip_len; i++) {
+        if (clipboard[i] == '\n') split_line();
+        else insert_char((unsigned char) clipboard[i]);
+    }
+    strcpy(status_msg, "Pasted.");
+}
+
 void cmd_save_as(void)
 {
     char buf[80];
@@ -1012,7 +1141,12 @@ void execute_menu_item(int cat, int idx)
             case 4: cmd_quit_request(); break;
         }
     } else if (cat == 1) {
-        if (idx == 0) do_undo();
+        switch (idx) {
+            case 0: do_undo();  break;
+            case 1: cmd_cut();  break;
+            case 2: cmd_copy(); break;
+            case 3: cmd_paste(); break;
+        }
     } else if (cat == 2) {
         switch (idx) {
             case 0: cmd_find();      break;
@@ -1094,7 +1228,9 @@ int main(int argc, char **argv)
             else if (lo == 14) cmd_new();
             else if (lo == 15) cmd_open();
             else if (lo == 19) cmd_save();
-            else if (lo == 22) toggle_vim_mode();
+            else if (lo == 3)  cmd_copy();
+            else if (lo == 24) cmd_cut();
+            else if (lo == 22) cmd_paste();
             else if (lo == 26) do_undo();
             else if (vim_pending == 'd' && lo == 'd') { delete_current_line(); vim_pending = 0; }
             else if (lo == 'h') { move_left();      vim_pending = 0; }
@@ -1112,16 +1248,14 @@ int main(int argc, char **argv)
             else vim_pending = 0;   /* unrecognized: swallow, don't insert */
         }
         else if (lo == 27) {
-            /* Escape clears an active selection first, before its
-             * usual job (Insert->Normal in vim mode, or quit) --
-             * same key, but selection takes priority when there is
-             * one, same as most editors. */
+            /* Esc no longer quits (see Alt+X below) -- it now only
+             * clears an active selection, or in vim mode drops back
+             * from Insert to Normal. With neither applicable, it's
+             * simply a no-op, same as most editors treat a bare Esc. */
             if (sel_active) {
                 sel_clear();
             } else if (vim_mode) {
                 vim_insert = 0; vim_pending = 0;  /* Insert -> Normal */
-            } else {
-                cmd_quit_request();
             }
         } else if (lo == 0) {
             matched = 0;
@@ -1156,6 +1290,8 @@ int main(int argc, char **argv)
                     case 0x53: delete_forward(); break;
                     case 0x3C: view_mode = !view_mode; break;  /* F2 */
                     case 0x3D: cmd_find_next();  break;         /* F3 */
+                    case 0x3E: toggle_vim_mode(); break;        /* F4 */
+                    case 0x2D: cmd_quit_request(); break;       /* Alt+X */
                     default: break;
                 }
             }
@@ -1167,7 +1303,9 @@ int main(int argc, char **argv)
         else if (lo == 14) cmd_new();
         else if (lo == 15) cmd_open();
         else if (lo == 19) cmd_save();
-        else if (lo == 22) toggle_vim_mode();
+        else if (lo == 3)  cmd_copy();
+        else if (lo == 24) cmd_cut();
+        else if (lo == 22) cmd_paste();
         else if (lo == 26) do_undo();
         else if (lo >= 32 && lo < 127) insert_char(lo);
 
