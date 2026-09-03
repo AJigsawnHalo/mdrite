@@ -1,87 +1,9 @@
 /*
- * mdedit.c - a small DOS/FreeDOS markdown writer, inspired by
+ * mdrite.c - a small DOS/FreeDOS markdown writer, inspired by
  * ArtfulType (github.com/ActionRetro/ArtfulType) for 68k Mac.
  *
- * Build (Open Watcom):
- *     wcl -0 -ml -bt=dos mdedit.c -fe=mdedit
- * (no ".exe" after -fe= -- wcl appends it itself)
- *
- * Run:      mdedit.exe [filename]
- *
- * Keys:
- *   Arrows, Home, End, PgUp, PgDn   - move cursor
- *   Shift + any of the above        - select text (works across
- *     lines); releasing Shift keeps the selection until you move
- *     without Shift, type, or press Esc
- *   Enter / Backspace / Del         - edit text
- *   Ctrl+S Save   Ctrl+O Open   Ctrl+N New   Ctrl+A Save As
- *   Ctrl+F Find   F3 Find Next  Ctrl+G Go To Line
- *   Ctrl+Z Undo (last edit only)
- *   Ctrl+C Copy   Ctrl+X Cut   Ctrl+V Paste
- *     Cut/Copy need an active selection ("Nothing selected." in the
- *     status bar otherwise). Paste replaces an active selection if
- *     there is one, same as everywhere else; plain typing does NOT
- *     yet replace a selection the same way -- worth knowing until
- *     that's unified. One clipboard slot, no history.
- *   F2   Toggle Writer view / raw Markdown view
- *   F4   Toggle vim-lite keymapping on/off (also under View)
- *   Alt+X   Quit (confirms if there are unsaved changes) -- moved
- *     here from Esc to match the WordStar/early-DOS-editor
- *     convention of Alt+X for eXit
- *   Alt+F / Alt+E / Alt+S / Alt+V  open the File / Edit / Search /
- *     View pull-down menu on the bottom bar. Arrows move within it,
- *     Left/Right switch menus, Enter runs the selected item, Esc
- *     closes it. Every menu item just calls the same function its
- *     shortcut does -- the menu is a second way in, not a separate
- *     code path.
- *   Vim-lite mode (F4 to toggle, off by default). Starts in Normal
- *     sub-mode:
- *       h/j/k/l move, 0/$ start/end of line, i insert (before
- *       cursor), a insert (after cursor), x delete char, dd delete
- *       line, u undo, : opens a command line (:w :q :wq :q!).
- *       Esc in Insert sub-mode returns to Normal.
- *     Ctrl-shortcuts (including Copy/Cut/Paste), Enter, and
- *     Backspace keep working the same in both sub-modes. This is a
- *     small, honestly-scoped subset -- no word motions (w/b/e), no
- *     vim-style visual-mode selection (Shift+arrows works in vim
- *     mode too, just not v/V), no yank/paste registers, no counts
- *     ("3dd"), no macros. See "NOT IN HERE YET" below for the full
- *     list of what's still missing, vim-specific and otherwise.
- *   Esc, outside of vim mode and menus: clears an active selection
- *     if there is one; otherwise it's a no-op now that quitting has
- *     its own key (Alt+X).
- *
- * MARKDOWN SUPPORTED IN WRITER VIEW:
- *   **bold**   *italic*   `code`   ~~strikethrough~~
- *   # / ## / ### heading (background-highlighted, one style for all
- *     levels for now -- per-level styling is an easy follow-up)
- *   > blockquote (background-highlighted, whole line, no nested
- *     inline styles inside it yet)
- *   [link text](url)  -- url is hidden, only the label shows,
- *     underline-style color instead of a real underline
- *   - list item  (hyphen bullets only -- asterisk bullets would
- *     collide with italic's '*' in a simple single-pass scanner)
- *   ---  on its own line -- full-width horizontal rule
- *
- * TEXT-MODE LIMITS, ON PURPOSE:
- *   - No real bold weight, italic slant, or underline glyph exists
- *     in a fixed 8x16 text-mode font -- everything above is color-
- *     coded instead. Headings/blockquotes get a background fill
- *     (your WordPerfect-underline idea) since that reads clearly
- *     without needing an actual underline attribute.
- *   - Each screen cell has exactly one attribute byte, so if bold
- *     and italic are both "on" at the same spot, only one color
- *     wins (code > strikethrough > bold > italic > normal). Can't
- *     stack colors in 16-color text mode.
- *   - Zoom, true reflowed word-wrap, Replace, and multi-level undo
- *     are still not here -- see the earlier conversation for why
- *     each of those is its own small project. A selection deleted
- *     or replaced across multiple lines also isn't undoable yet,
- *     for the same single-line-undo reason line splits/merges
- *     aren't.
- *
- * I don't have a DOS/Watcom environment to test this here, so
- * treat each build like a normal first build of new code.
+ * See README.md for build/run instructions, the full keybinding
+ * list, supported Markdown syntax, and known limitations.
  */
 
 #include <dos.h>
