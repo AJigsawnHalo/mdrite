@@ -522,17 +522,133 @@ void delete_current_line(void)
     undo_line_no = -1;
 }
 
+/* Maps a raw buffer column (an index into doc[line]->text, including
+ * hidden markdown delimiters) to the screen column it actually shows
+ * up at in Writer view. Mirrors render_line's hiding logic exactly --
+ * whenever render_line consumes a delimiter without drawing it, this
+ * walks past it without counting a column either, so the two stay in
+ * sync. Only meaningful in Writer view; raw Markdown view is already
+ * 1:1 (minus horizontal scroll) and doesn't need this.
+ *
+ * Known imprecision: a [link](url) collapses ALL of its raw
+ * positions -- brackets, label, and url alike -- to a single screen
+ * column, the same simplification noted where this is used for
+ * cursor placement. That means Left/Right (below) can't currently
+ * stop inside a link's visible label in Writer view; they'll jump
+ * clean over the whole link in one step, same as they now do for
+ * bold/italic/etc. Worth fixing properly if that turns out to
+ * matter in practice -- it would need this function to walk the
+ * label's characters individually instead of returning early. */
+int writer_screen_col(const char *text, int raw_col)
+{
+    int i = 0, col = 0, len = (int) strlen(text);
+
+    if (raw_col > len) raw_col = len;
+
+    if (len >= 3) {
+        int all_dash = 1, ii;
+        for (ii = 0; ii < len; ii++) if (text[ii] != '-') { all_dash = 0; break; }
+        if (all_dash) return raw_col;
+    }
+
+    if (text[0] == '#') {
+        while (i < len && text[i] == '#' && i < raw_col) i++;
+        if (i < len && text[i] == ' ' && i < raw_col) i++;
+        if (raw_col <= i) return 0;
+        return raw_col - i;
+    }
+
+    if (text[0] == '>') {
+        i = 1;
+        if (i < len && text[i] == ' ') i++;
+        if (raw_col <= i) return 0;
+        return raw_col - i;
+    }
+
+    if (text[0] == '-' && len > 1 && text[1] == ' ') {
+        if (raw_col < 2) return 0;
+        col = 1;
+        i = 2;
+    }
+
+    while (i < raw_col && i < len) {
+        if (text[i] == '*' && i + 1 < len && text[i + 1] == '*') { i += 2; continue; }
+        if (text[i] == '*') { i++; continue; }
+        if (text[i] == '`') { i++; continue; }
+        if (text[i] == '~' && i + 1 < len && text[i + 1] == '~') { i += 2; continue; }
+        if (text[i] == '[') {
+            int j = i + 1;
+            while (j < len && text[j] != ']') j++;
+            if (j < len && j + 1 < len && text[j + 1] == '(') {
+                int k = j + 2;
+                while (k < len && text[k] != ')') k++;
+                if (k < len) {
+                    if (raw_col <= k) return col;  /* cursor inside the link markup */
+                    col += (j - (i + 1));           /* label length */
+                    i = k + 1;
+                    continue;
+                }
+            }
+        }
+        i++;
+        col++;
+    }
+    return col;
+}
+
+/* Right-arrow step for Writer view: advances raw_col past however
+ * many raw characters share the current screen column (i.e. past a
+ * whole hidden run -- a heading/blockquote prefix, a list bullet's
+ * "- ", or a bold/code/strike delimiter pair) so one keypress
+ * always lands on the next actually-different on-screen position,
+ * never mid-hidden-run. Built entirely on writer_screen_col above
+ * rather than re-parsing the line a third time, so it automatically
+ * covers every hidden-markup case that function does (see its own
+ * note re: links). Falls straight through to a plain +1 wherever
+ * there's nothing hidden to skip. */
+int writer_move_right(const char *text, int raw_col)
+{
+    int len = (int) strlen(text);
+    int start_screen = writer_screen_col(text, raw_col);
+    int new_col = raw_col + 1;
+    while (new_col < len && writer_screen_col(text, new_col) == start_screen) new_col++;
+    return new_col;
+}
+
+/* Left-arrow step for Writer view: the mirror image of
+ * writer_move_right above, and its exact inverse -- writer_move_left
+ * (writer_move_right(text, x)) == x and vice versa. Walks back to
+ * the start of whatever screen-column "slot" the character just
+ * left of raw_col belongs to. */
+int writer_move_left(const char *text, int raw_col)
+{
+    int target_screen = writer_screen_col(text, raw_col - 1);
+    int new_col = raw_col - 1;
+    while (new_col > 0 && writer_screen_col(text, new_col - 1) == target_screen) new_col--;
+    return new_col;
+}
+
 /* ================= cursor movement ================= */
 
 void move_left(void)
 {
-    if (cur_col > 0) cur_col--;
-    else if (cur_line > 0) { cur_line--; cur_col = doc[cur_line]->len; }
+    if (cur_col > 0) {
+        cur_col = (view_mode == 0) ? writer_move_left(doc[cur_line]->text, cur_col)
+                                    : cur_col - 1;
+    } else if (cur_line > 0) {
+        cur_line--;
+        cur_col = doc[cur_line]->len;
+    }
 }
 void move_right(void)
 {
-    if (cur_col < doc[cur_line]->len) cur_col++;
-    else if (cur_line < doc_count - 1) { cur_line++; cur_col = 0; }
+    if (cur_col < doc[cur_line]->len) {
+        cur_col = (view_mode == 0) ? writer_move_right(doc[cur_line]->text, cur_col)
+                                    : cur_col + 1;
+    } else if (cur_line < doc_count - 1) {
+        cur_line++;
+        cur_col = 0;
+    }
 }
 void move_up(void)
 {
@@ -627,6 +743,20 @@ void render_line(const char *text, int row, int offset, int sel_start, int sel_e
     int i = 0, col = 0, len = strlen(text);
     int bold = 0, italic = 0, code = 0, strike = 0, scr;
     unsigned char attr;
+    /* Tracks the most recently drawn VISIBLE character, so that when
+     * a hidden run right after it (a bold/code/strike delimiter, or
+     * a link's closing ](url)) is part of the selection, we can retroactively
+     * re-highlight that one already-drawn cell as a "selection
+     * continues past here, invisibly" signal. Without this there's
+     * no way to see on screen whether you've actually selected past
+     * a closing delimiter or stopped just short of it -- both look
+     * identical, since the hidden characters occupy zero screen
+     * width either way. Deliberately just recolors an existing cell
+     * rather than adding a new one, so it can't disturb
+     * writer_screen_col's zero-width assumption for hidden runs. */
+    int last_col = -1;
+    char last_ch = ' ';
+    unsigned char last_attr = ATTR_NORMAL;
 
     clear_row(row, ATTR_NORMAL);
 
@@ -685,15 +815,23 @@ void render_line(const char *text, int row, int offset, int sel_start, int sel_e
 
     while (i < len) {
         if (text[i] == '*' && i + 1 < len && text[i + 1] == '*') {
+            if (last_col >= 0 && sel_overlaps(i, i + 2, sel_start, sel_end))
+                put_char(last_col, row, last_ch, swap_attr(last_attr));
             bold = !bold; i += 2; continue;
         }
         if (text[i] == '*') {
+            if (last_col >= 0 && sel_overlaps(i, i + 1, sel_start, sel_end))
+                put_char(last_col, row, last_ch, swap_attr(last_attr));
             italic = !italic; i++; continue;
         }
         if (text[i] == '`') {
+            if (last_col >= 0 && sel_overlaps(i, i + 1, sel_start, sel_end))
+                put_char(last_col, row, last_ch, swap_attr(last_attr));
             code = !code; i++; continue;
         }
         if (text[i] == '~' && i + 1 < len && text[i + 1] == '~') {
+            if (last_col >= 0 && sel_overlaps(i, i + 2, sel_start, sel_end))
+                put_char(last_col, row, last_ch, swap_attr(last_attr));
             strike = !strike; i += 2; continue;
         }
         if (text[i] == '[') {
@@ -704,11 +842,17 @@ void render_line(const char *text, int row, int offset, int sel_start, int sel_e
                 while (k < len && text[k] != ')') k++;
                 if (k < len) {
                     int m;
+                    if (last_col >= 0 && sel_overlaps(i, i + 1, sel_start, sel_end))
+                        put_char(last_col, row, last_ch, swap_attr(last_attr));  /* leading '[' */
                     for (m = i + 1; m < j; m++) {
-                        if (col < SCREEN_COLS)
+                        if (col < SCREEN_COLS) {
                             put_char(col, row, text[m], apply_sel(ATTR_LINK, m, sel_start, sel_end));
+                            last_col = col; last_ch = text[m]; last_attr = ATTR_LINK;
+                        }
                         col++;
                     }
+                    if (last_col >= 0 && sel_overlaps(j, k + 1, sel_start, sel_end))
+                        put_char(last_col, row, last_ch, swap_attr(last_attr));  /* "](url)" */
                     i = k + 1;
                     continue;
                 }
@@ -721,74 +865,11 @@ void render_line(const char *text, int row, int offset, int sel_start, int sel_e
                  : italic ? ATTR_ITALIC
                  : ATTR_NORMAL;
             put_char(col, row, text[i], apply_sel(attr, i, sel_start, sel_end));
+            last_col = col; last_ch = text[i]; last_attr = attr;
         }
         i++;
         col++;
     }
-}
-
-/* Maps a raw buffer column (an index into doc[line]->text, including
- * hidden markdown delimiters) to the screen column it actually shows
- * up at in Writer view. Mirrors render_line's hiding logic exactly --
- * whenever render_line consumes a delimiter without drawing it, this
- * walks past it without counting a column either, so the two stay in
- * sync. Only meaningful in Writer view; raw Markdown view is already
- * 1:1 (minus horizontal scroll) and doesn't need this. */
-int writer_screen_col(const char *text, int raw_col)
-{
-    int i = 0, col = 0, len = (int) strlen(text);
-
-    if (raw_col > len) raw_col = len;
-
-    if (len >= 3) {
-        int all_dash = 1, ii;
-        for (ii = 0; ii < len; ii++) if (text[ii] != '-') { all_dash = 0; break; }
-        if (all_dash) return raw_col;
-    }
-
-    if (text[0] == '#') {
-        while (i < len && text[i] == '#' && i < raw_col) i++;
-        if (i < len && text[i] == ' ' && i < raw_col) i++;
-        if (raw_col <= i) return 0;
-        return raw_col - i;
-    }
-
-    if (text[0] == '>') {
-        i = 1;
-        if (i < len && text[i] == ' ') i++;
-        if (raw_col <= i) return 0;
-        return raw_col - i;
-    }
-
-    if (text[0] == '-' && len > 1 && text[1] == ' ') {
-        if (raw_col < 2) return 0;
-        col = 1;
-        i = 2;
-    }
-
-    while (i < raw_col && i < len) {
-        if (text[i] == '*' && i + 1 < len && text[i + 1] == '*') { i += 2; continue; }
-        if (text[i] == '*') { i++; continue; }
-        if (text[i] == '`') { i++; continue; }
-        if (text[i] == '~' && i + 1 < len && text[i + 1] == '~') { i += 2; continue; }
-        if (text[i] == '[') {
-            int j = i + 1;
-            while (j < len && text[j] != ']') j++;
-            if (j < len && j + 1 < len && text[j + 1] == '(') {
-                int k = j + 2;
-                while (k < len && text[k] != ')') k++;
-                if (k < len) {
-                    if (raw_col <= k) return col;  /* cursor inside the link markup */
-                    col += (j - (i + 1));           /* label length */
-                    i = k + 1;
-                    continue;
-                }
-            }
-        }
-        i++;
-        col++;
-    }
-    return col;
 }
 
 void draw_status_bar(void)
