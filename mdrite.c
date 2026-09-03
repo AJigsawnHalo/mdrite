@@ -19,7 +19,7 @@
 #define STATUS_ROW    (SCREEN_ROWS - 2)
 #define CMDBAR_ROW    (SCREEN_ROWS - 1)
 #define TEXT_ROWS     (SCREEN_ROWS - 2)
-#define MAX_LINE_LEN  200
+#define MAX_LINE_LEN  1024
 #define MAX_LINES     2000
 
 /* ---------- color attributes ---------- */
@@ -565,6 +565,116 @@ int writer_move_left(const char *text, int raw_col)
     return new_col;
 }
 
+/* ================= word wrap (Writer view only) ================= */
+
+#define MAX_WRAP_ROWS 16
+
+/* Raw-column offsets at which each wrapped visual row of `text`
+ * begins, when rendered in Writer view at SCREEN_COLS width.
+ * starts[0] is always 0. Returns the number of visual rows (>= 1),
+ * capped at MAX_WRAP_ROWS -- a document line is at most MAX_LINE_LEN
+ * raw chars, which can never wrap into more than a handful of
+ * 80-column rows, so the cap is never actually hit in practice.
+ *
+ * Mirrors the construct-by-construct parsing writer_screen_col and
+ * render_writer_line use (HR, heading, blockquote, list, then the
+ * shared bold/italic/code/strike/link inline scanner) closely enough
+ * that all three always agree on where a line's visible text sits --
+ * but instead of hard-clipping at column 80 like the old renderer
+ * did, it prefers the most recent space, giving real word-wrap
+ * instead of a mid-word chop. A run with no space to break at (e.g.
+ * one very long "word") still hard-breaks at the column limit, same
+ * as before. */
+int compute_wrap_starts(const char *text, int *starts)
+{
+    int len = (int) strlen(text);
+    int seg_start = 0, nstarts = 1;
+    int i, base_col, screen_col, last_space, brk;
+    int wrapped;
+
+    starts[0] = 0;
+
+    if (len >= 3) {
+        int all_dash = 1, ii;
+        for (ii = 0; ii < len; ii++) if (text[ii] != '-') { all_dash = 0; break; }
+        if (all_dash) return 1;   /* horizontal rule: always one row */
+    }
+
+    /*
+     * Measure wrapping using the same screen-column calculation as the
+     * cursor and renderer.  The previous implementation kept a separate
+     * column counter and could disagree with writer_screen_col() after
+     * moving a wrap point back to the previous space.  That caused clipped
+     * words and missing characters.
+     *
+     * For each segment, restart at the exact raw column where the segment
+     * begins.  writer_screen_col() already knows which Markdown characters
+     * are hidden in Writer view, so this avoids maintaining a second parser.
+     */
+    while (seg_start < len && nstarts < MAX_WRAP_ROWS) {
+        base_col = writer_screen_col(text, seg_start);
+        last_space = -1;
+        wrapped = 0;
+
+        for (i = seg_start; i <= len; i++) {
+            screen_col = writer_screen_col(text, i) - base_col;
+
+            if (screen_col >= SCREEN_COLS) {
+                brk = (last_space >= seg_start) ? last_space + 1 : i;
+
+                /* Always make progress, even on an unusually long token. */
+                if (brk <= seg_start) brk = i;
+                if (brk <= seg_start) break;
+
+                starts[nstarts++] = brk;
+                seg_start = brk;
+                wrapped = 1;
+                break;
+            }
+
+            if (i < len && text[i] == ' ') last_space = i;
+        }
+
+        if (!wrapped) break;
+    }
+
+    return nstarts;
+}
+
+/* Number of visual rows `line_no` occupies in the current view --
+ * always 1 in raw Markdown view, which still shows one buffer line
+ * per screen row and scrolls horizontally instead (see left_col). */
+int line_rows(int line_no)
+{
+    int starts[MAX_WRAP_ROWS];
+    if (view_mode == 1) return 1;
+    return compute_wrap_starts(doc[line_no]->text, starts);
+}
+
+/* Which wrap segment (0-based) raw column `col` falls into. */
+int wrap_seg_of_col(int *starts, int nstarts, int col)
+{
+    int k;
+    for (k = nstarts - 1; k >= 0; k--) if (col >= starts[k]) return k;
+    return 0;
+}
+
+/* The raw column in [lo, hi] whose Writer-view screen column,
+ * relative to `lo`, is the closest to target_col without exceeding
+ * it. This is what keeps the cursor's screen column stable when
+ * Up/Down crosses a wrapped row -- the vertical equivalent of what
+ * writer_move_left/right already do for horizontal steps. */
+int col_for_target_screen(const char *text, int lo, int hi, int target_col)
+{
+    int base = writer_screen_col(text, lo);
+    int best = lo, c;
+    for (c = lo; c <= hi; c++) {
+        if (writer_screen_col(text, c) - base > target_col) break;
+        best = c;
+    }
+    return best;
+}
+
 /* ================= cursor movement ================= */
 
 void move_left(void)
@@ -587,18 +697,60 @@ void move_right(void)
         cur_col = 0;
     }
 }
+/* Up/Down in Writer view step by *visual* row, not buffer line: on a
+ * wrapped line they move between wrap segments first, only crossing
+ * into the previous/next buffer line once they're on its first/last
+ * segment -- same convention as everything else here (a text editor,
+ * not a form field). Raw Markdown view is unwrapped, so it keeps the
+ * old one-buffer-line-per-row behavior unchanged. */
 void move_up(void)
 {
-    if (cur_line > 0) {
+    int starts[MAX_WRAP_ROWS], n, seg, target;
+    if (view_mode == 1) {
+        if (cur_line > 0) {
+            cur_line--;
+            if (cur_col > doc[cur_line]->len) cur_col = doc[cur_line]->len;
+        }
+        return;
+    }
+    n = compute_wrap_starts(doc[cur_line]->text, starts);
+    seg = wrap_seg_of_col(starts, n, cur_col);
+    target = writer_screen_col(doc[cur_line]->text, cur_col)
+           - writer_screen_col(doc[cur_line]->text, starts[seg]);
+    if (seg > 0) {
+        cur_col = col_for_target_screen(doc[cur_line]->text, starts[seg - 1],
+                                          starts[seg] - 1, target);
+    } else if (cur_line > 0) {
+        int pstarts[MAX_WRAP_ROWS], pn;
         cur_line--;
-        if (cur_col > doc[cur_line]->len) cur_col = doc[cur_line]->len;
+        pn = compute_wrap_starts(doc[cur_line]->text, pstarts);
+        cur_col = col_for_target_screen(doc[cur_line]->text, pstarts[pn - 1],
+                                          doc[cur_line]->len, target);
     }
 }
 void move_down(void)
 {
-    if (cur_line < doc_count - 1) {
+    int starts[MAX_WRAP_ROWS], n, seg, target;
+    if (view_mode == 1) {
+        if (cur_line < doc_count - 1) {
+            cur_line++;
+            if (cur_col > doc[cur_line]->len) cur_col = doc[cur_line]->len;
+        }
+        return;
+    }
+    n = compute_wrap_starts(doc[cur_line]->text, starts);
+    seg = wrap_seg_of_col(starts, n, cur_col);
+    target = writer_screen_col(doc[cur_line]->text, cur_col)
+           - writer_screen_col(doc[cur_line]->text, starts[seg]);
+    if (seg + 1 < n) {
+        int seg_end = (seg + 2 < n) ? starts[seg + 2] - 1 : doc[cur_line]->len;
+        cur_col = col_for_target_screen(doc[cur_line]->text, starts[seg + 1], seg_end, target);
+    } else if (cur_line < doc_count - 1) {
+        int nstarts[MAX_WRAP_ROWS], nn, hi;
         cur_line++;
-        if (cur_col > doc[cur_line]->len) cur_col = doc[cur_line]->len;
+        nn = compute_wrap_starts(doc[cur_line]->text, nstarts);
+        hi = (nn > 1) ? nstarts[1] - 1 : doc[cur_line]->len;
+        cur_col = col_for_target_screen(doc[cur_line]->text, 0, hi, target);
     }
 }
 void move_home(void) { cur_col = 0; }
@@ -606,21 +758,54 @@ void move_end(void)  { cur_col = doc[cur_line]->len; }
 
 void page_up(void)
 {
-    cur_line -= TEXT_ROWS;
-    if (cur_line < 0) cur_line = 0;
+    if (view_mode == 1) {
+        cur_line -= TEXT_ROWS;
+        if (cur_line < 0) cur_line = 0;
+    } else {
+        int rows = 0;
+        while (cur_line > 0 && rows < TEXT_ROWS) {
+            cur_line--;
+            rows += line_rows(cur_line);
+        }
+    }
     if (cur_col > doc[cur_line]->len) cur_col = doc[cur_line]->len;
 }
 void page_down(void)
 {
-    cur_line += TEXT_ROWS;
-    if (cur_line >= doc_count) cur_line = doc_count - 1;
+    if (view_mode == 1) {
+        cur_line += TEXT_ROWS;
+        if (cur_line >= doc_count) cur_line = doc_count - 1;
+    } else {
+        int rows = 0;
+        while (cur_line < doc_count - 1 && rows < TEXT_ROWS) {
+            rows += line_rows(cur_line);
+            cur_line++;
+        }
+    }
     if (cur_col > doc[cur_line]->len) cur_col = doc[cur_line]->len;
 }
 
+/* Grows top_line (in whole buffer lines -- a line's visual rows
+ * always scroll onto/off screen together) until the cursor's visual
+ * row lands within the TEXT_ROWS window. Raw Markdown view is
+ * unwrapped, so it keeps the old exact-line-count logic. */
 void scroll_to_cursor(void)
 {
+    if (view_mode == 1) {
+        if (cur_line < top_line) top_line = cur_line;
+        if (cur_line >= top_line + TEXT_ROWS) top_line = cur_line - TEXT_ROWS + 1;
+        return;
+    }
     if (cur_line < top_line) top_line = cur_line;
-    if (cur_line >= top_line + TEXT_ROWS) top_line = cur_line - TEXT_ROWS + 1;
+    for (;;) {
+        int rows = 0, ln, starts[MAX_WRAP_ROWS], n, seg;
+        for (ln = top_line; ln < cur_line; ln++) rows += line_rows(ln);
+        n = compute_wrap_starts(doc[cur_line]->text, starts);
+        seg = wrap_seg_of_col(starts, n, cur_col);
+        rows += seg;
+        if (rows < TEXT_ROWS || top_line >= cur_line) break;
+        top_line++;
+    }
 }
 
 /* ================= rendering ================= */
@@ -675,38 +860,48 @@ unsigned char apply_sel(unsigned char attr, int raw_col, int sel_start, int sel_
  * [sel_start, sel_end); sel_start == -1 means no selection touches
  * this row. Callers get these from sel_line_range().
  */
+/* Raw Markdown view: one buffer line per screen row, unwrapped,
+ * scrolled horizontally by `offset` (see left_col). */
 void render_line(const char *text, int row, int offset, int sel_start, int sel_end)
 {
-    int i = 0, col = 0, len = strlen(text);
-    int bold = 0, italic = 0, code = 0, strike = 0, scr;
+    int i, len = (int) strlen(text), scr;
+    clear_row(row, ATTR_NORMAL);
+    for (i = 0; i < len; i++) {
+        scr = i - offset;
+        if (scr >= 0 && scr < SCREEN_COLS)
+            put_char(scr, row, text[i], apply_sel(ATTR_NORMAL, i, sel_start, sel_end));
+    }
+}
+
+/* Writer view: draws one *visual* row -- the word-wrapped raw-column
+ * slice [seg_start, seg_end) of `text` that compute_wrap_starts
+ * decided belongs on this screen row. Because that slice was already
+ * chosen to fit within SCREEN_COLS at a word boundary, this never
+ * needs to clip mid-word the way the old single-row-per-line
+ * render_line did.
+ *
+ * For a continuation row (seg_start > 0) that lands inside a run of
+ * inline markup, the initial bold/italic/code/strike state is
+ * recovered by silently replaying the same scanner from just after
+ * any heading/quote/list prefix up to seg_start, without drawing
+ * anything -- the same trick writer_screen_col already uses to
+ * answer "where is raw column X on screen" without keeping any
+ * separate persistent state. (A `[link](url)` that itself straddles
+ * a wrap point is the one case this replay can lose sync with -- an
+ * accepted rough edge, same spirit as the other Known Limitations.) */
+void render_writer_line(const char *text, int row, int seg_start, int seg_end,
+                         int sel_start, int sel_end)
+{
+    int i, col = 0, len = (int) strlen(text);
+    int bold = 0, italic = 0, code = 0, strike = 0;
     unsigned char attr;
-    /* Tracks the most recently drawn VISIBLE character, so that when
-     * a hidden run right after it (a bold/code/strike delimiter, or
-     * a link's closing ](url)) is part of the selection, we can retroactively
-     * re-highlight that one already-drawn cell as a "selection
-     * continues past here, invisibly" signal. Without this there's
-     * no way to see on screen whether you've actually selected past
-     * a closing delimiter or stopped just short of it -- both look
-     * identical, since the hidden characters occupy zero screen
-     * width either way. Deliberately just recolors an existing cell
-     * rather than adding a new one, so it can't disturb
-     * writer_screen_col's zero-width assumption for hidden runs. */
     int last_col = -1;
     char last_ch = ' ';
     unsigned char last_attr = ATTR_NORMAL;
 
     clear_row(row, ATTR_NORMAL);
 
-    if (view_mode == 1) {
-        for (i = 0; i < len; i++) {
-            scr = i - offset;
-            if (scr >= 0 && scr < SCREEN_COLS)
-                put_char(scr, row, text[i], apply_sel(ATTR_NORMAL, i, sel_start, sel_end));
-        }
-        return;
-    }
-
-    /* horizontal rule: a line that is nothing but 3+ hyphens */
+    /* horizontal rule: a line that is nothing but 3+ hyphens (always one row) */
     if (len >= 3) {
         int all_dash = 1, ii;
         for (ii = 0; ii < len; ii++) if (text[ii] != '-') { all_dash = 0; break; }
@@ -720,37 +915,66 @@ void render_line(const char *text, int row, int offset, int sel_start, int sel_e
         }
     }
 
-    /* heading */
+    /* heading -- flat attribute, no inline toggles to replay */
     if (text[0] == '#') {
+        i = 0;
         while (i < len && text[i] == '#') i++;
         if (i < len && text[i] == ' ') i++;
-        for (; i < len && col < SCREEN_COLS; i++, col++)
+        if (seg_start > i) i = seg_start;
+        for (; i < len && i < seg_end && col < SCREEN_COLS; i++, col++)
             put_char(col, row, text[i], apply_sel(ATTR_HEAD, i, sel_start, sel_end));
         return;
     }
 
-    /* blockquote */
+    /* blockquote -- flat attribute, no inline toggles to replay */
     if (text[0] == '>') {
         i = 1;
         if (i < len && text[i] == ' ') i++;
-        for (; i < len && col < SCREEN_COLS; i++, col++)
+        if (seg_start > i) i = seg_start;
+        for (; i < len && i < seg_end && col < SCREEN_COLS; i++, col++)
             put_char(col, row, text[i], apply_sel(ATTR_QUOTE, i, sel_start, sel_end));
         return;
     }
 
-    /* list item: hyphen bullet only (asterisk would collide with italic) */
+    i = 0;
     if (text[0] == '-' && len > 1 && text[1] == ' ') {
-        /* the bullet glyph stands in for raw columns 0-1 (the "- "
-         * prefix), so it's checked as a 2-wide range rather than a
-         * single raw column like everything else here */
-        attr = sel_overlaps(0, 2, sel_start, sel_end) ? swap_attr(ATTR_LISTMARK) : ATTR_LISTMARK;
-        put_char(0, row, (char) 7, attr);  /* CP437 bullet glyph */
-        col = 1;
-        i = 2;
-        /* falls through to the inline scanner below for the rest */
+        if (seg_start == 0) {
+            /* the bullet glyph stands in for raw columns 0-1 (the "- "
+             * prefix), so it's checked as a 2-wide range rather than a
+             * single raw column like everything else here */
+            attr = sel_overlaps(0, 2, sel_start, sel_end) ? swap_attr(ATTR_LISTMARK) : ATTR_LISTMARK;
+            put_char(0, row, (char) 7, attr);  /* CP437 bullet glyph */
+            col = 1;
+            i = 2;
+        } else {
+            i = 2;   /* continuation row: replay starts right after "- " */
+        }
     }
 
-    while (i < len) {
+    /* continuation row: silently replay inline toggles up to seg_start */
+    if (seg_start > i) {
+        int r = i;
+        while (r < seg_start) {
+            if (text[r] == '*' && r + 1 < len && text[r + 1] == '*') { bold = !bold; r += 2; continue; }
+            if (text[r] == '*') { italic = !italic; r++; continue; }
+            if (text[r] == '`') { code = !code; r++; continue; }
+            if (text[r] == '~' && r + 1 < len && text[r + 1] == '~') { strike = !strike; r += 2; continue; }
+            if (text[r] == '[') {
+                int j = r + 1;
+                while (j < len && text[j] != ']') j++;
+                if (j < len && j + 1 < len && text[j + 1] == '(') {
+                    int k = j + 2;
+                    while (k < len && text[k] != ')') k++;
+                    if (k < len) { r = k + 1; continue; }
+                }
+            }
+            r++;
+        }
+        i = seg_start;
+        col = 0;
+    }
+
+    while (i < len && i < seg_end) {
         if (text[i] == '*' && i + 1 < len && text[i + 1] == '*') {
             if (last_col >= 0 && sel_overlaps(i, i + 2, sel_start, sel_end))
                 put_char(last_col, row, last_ch, swap_attr(last_attr));
@@ -883,33 +1107,65 @@ void redraw_screen(void)
     if (view_mode == 1) {
         if (cur_col < left_col) left_col = cur_col;
         if (cur_col >= left_col + SCREEN_COLS) left_col = cur_col - SCREEN_COLS + 1;
-    } else {
-        left_col = 0;
-    }
 
-    for (r = 0; r < TEXT_ROWS; r++) {
-        ln = top_line + r;
-        if (ln < doc_count) {
-            int sel_start, sel_end;
-            sel_line_range(ln, doc[ln]->len, &sel_start, &sel_end);
-            render_line(doc[ln]->text, r, left_col, sel_start, sel_end);
-        } else {
-            clear_row(r, ATTR_NORMAL);
+        for (r = 0; r < TEXT_ROWS; r++) {
+            ln = top_line + r;
+            if (ln < doc_count) {
+                int sel_start, sel_end;
+                sel_line_range(ln, doc[ln]->len, &sel_start, &sel_end);
+                render_line(doc[ln]->text, r, left_col, sel_start, sel_end);
+            } else {
+                clear_row(r, ATTR_NORMAL);
+            }
+        }
+    } else {
+        /* Writer view: each buffer line may occupy several word-wrapped
+         * visual rows, so walk lines starting at top_line and, for
+         * each, draw all of its wrap segments until the screen fills. */
+        left_col = 0;
+        r = 0; ln = top_line;
+        while (r < TEXT_ROWS) {
+            if (ln >= doc_count) {
+                clear_row(r, ATTR_NORMAL);
+                r++;
+                continue;
+            }
+            {
+                int starts[MAX_WRAP_ROWS], n, seg, sel_start, sel_end;
+                n = compute_wrap_starts(doc[ln]->text, starts);
+                sel_line_range(ln, doc[ln]->len, &sel_start, &sel_end);
+                for (seg = 0; seg < n && r < TEXT_ROWS; seg++, r++) {
+                    int seg_end = (seg + 1 < n) ? starts[seg + 1] : doc[ln]->len;
+                    render_writer_line(doc[ln]->text, r, starts[seg], seg_end, sel_start, sel_end);
+                }
+            }
+            ln++;
         }
     }
+
     draw_status_bar();
     draw_menu_bar();
     if (menu_open >= 0) draw_menu_popup();
     {
-        int screen_col;
+        int screen_col, screen_row;
         if (view_mode == 1) {
             screen_col = cur_col - left_col;
+            screen_row = cur_line - top_line;
         } else {
-            screen_col = writer_screen_col(doc[cur_line]->text, cur_col);
+            int starts[MAX_WRAP_ROWS], n, seg, rows, l;
+            n = compute_wrap_starts(doc[cur_line]->text, starts);
+            seg = wrap_seg_of_col(starts, n, cur_col);
+            rows = 0;
+            for (l = top_line; l < cur_line; l++) rows += line_rows(l);
+            screen_row = rows + seg;
+            screen_col = writer_screen_col(doc[cur_line]->text, cur_col)
+                       - writer_screen_col(doc[cur_line]->text, starts[seg]);
         }
         if (screen_col < 0) screen_col = 0;
         if (screen_col >= SCREEN_COLS) screen_col = SCREEN_COLS - 1;
-        set_cursor(screen_col, cur_line - top_line);
+        if (screen_row < 0) screen_row = 0;
+        if (screen_row >= TEXT_ROWS) screen_row = TEXT_ROWS - 1;
+        set_cursor(screen_col, screen_row);
     }
 }
 
@@ -951,21 +1207,76 @@ int confirm(const char *msg)
 
 /* ================= file I/O ================= */
 
+/* Reads one full source line from f into a heap-allocated,
+ * NUL-terminated buffer -- however long it actually is, no fixed cap
+ * -- with any trailing '\n' stripped. *out_len receives its length.
+ * Returns 0 at EOF with nothing read, 1 otherwise; caller owns *out
+ * and must free() it.
+ *
+ * This exists so load_file() below never repeats the bug a fixed
+ * fgets(buf, MAX_LINE_LEN+1, f) buffer has: silently chopping a
+ * too-long real line at a fixed byte count, mid-word, and treating
+ * the leftover as an unrelated new line. */
+int read_full_line(FILE *f, char **out, int *out_len)
+{
+    int cap = 256, len = 0, ch;
+    char *buf = (char *) malloc(cap);
+    if (!buf) { *out = NULL; *out_len = 0; return 0; }
+    for (;;) {
+        ch = fgetc(f);
+        if (ch == EOF) {
+            if (len == 0) { free(buf); *out = NULL; *out_len = 0; return 0; }
+            break;
+        }
+        if (ch == '\n') break;
+        if (len + 1 >= cap) {
+            char *grown;
+            cap *= 2;
+            grown = (char *) realloc(buf, cap);
+            if (!grown) break;   /* out of memory: keep what we have so far */
+            buf = grown;
+        }
+        buf[len++] = (char) ch;
+    }
+    buf[len] = '\0';
+    *out = buf;
+    *out_len = len;
+    return 1;
+}
+
 void load_file(const char *fname)
 {
     FILE *f = fopen(fname, "r");
-    char linebuf[MAX_LINE_LEN + 1];
     int i;
+    char *raw;
+    int raw_len;
     if (!f) { strcpy(status_msg, "Could not open file."); return; }
     for (i = 0; i < doc_count; i++) free(doc[i]);
     doc_count = 0;
-    while (fgets(linebuf, sizeof(linebuf), f) && doc_count < MAX_LINES) {
-        int len = (int) strlen(linebuf);
-        if (len > 0 && linebuf[len - 1] == '\n') linebuf[--len] = '\0';
-        doc[doc_count] = new_line();
-        strcpy(doc[doc_count]->text, linebuf);
-        doc[doc_count]->len = len;
-        doc_count++;
+    while (doc_count < MAX_LINES && read_full_line(f, &raw, &raw_len)) {
+        int pos = 0;
+        do {
+            int chunk = raw_len - pos;
+            if (chunk > MAX_LINE_LEN) {
+                /* Only reached if a single real source line is
+                 * longer than MAX_LINE_LEN even after the bump above
+                 * -- back up to the last space so the forced split
+                 * lands between words, not inside one, the same
+                 * word-boundary preference compute_wrap_starts uses
+                 * for on-screen wrapping. */
+                int brk = pos + MAX_LINE_LEN, k;
+                for (k = brk; k > pos; k--) if (raw[k] == ' ') break;
+                chunk = (k > pos) ? (k - pos) : MAX_LINE_LEN;
+            }
+            doc[doc_count] = new_line();
+            memcpy(doc[doc_count]->text, raw + pos, chunk);
+            doc[doc_count]->text[chunk] = '\0';
+            doc[doc_count]->len = chunk;
+            doc_count++;
+            pos += chunk;
+            while (pos < raw_len && raw[pos] == ' ') pos++;  /* drop the break space itself */
+        } while (pos < raw_len && doc_count < MAX_LINES);
+        free(raw);
     }
     if (doc_count == 0) { doc[0] = new_line(); doc_count = 1; }
     fclose(f);
