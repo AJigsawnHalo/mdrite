@@ -98,3 +98,13 @@ Not implemented yet:
   splits/merges aren't.
 - No word motions (`w`/`b`/`e`), vim-style visual-mode selection,
   yank/paste registers, counts (`3dd`), or macros in vim-lite mode.
+
+## License
+
+BSD 3-Clause (see [LICENSE](LICENSE)), with one exception:
+
+- `tests/02story.md` -- "The Light We Make" (c) 2026 by Joash
+  Liwanag, licensed separately under
+  [CC BY-ND 4.0](http://creativecommons.org/licenses/by-nd/4.0/).
+  See the license notice inside that file for details. This work is
+  NOT covered by the BSD 3-Clause License above.
