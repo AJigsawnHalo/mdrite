@@ -588,8 +588,9 @@ int writer_move_left(const char *text, int raw_col)
 int compute_wrap_starts(const char *text, int *starts)
 {
     int len = (int) strlen(text);
-    int i = 0, col = 0, nstarts = 1;
-    int last_space = -1;
+    int seg_start = 0, nstarts = 1;
+    int i, base_col, screen_col, last_space, brk;
+    int wrapped;
 
     starts[0] = 0;
 
@@ -599,48 +600,44 @@ int compute_wrap_starts(const char *text, int *starts)
         if (all_dash) return 1;   /* horizontal rule: always one row */
     }
 
-    if (text[0] == '#') {
-        while (i < len && text[i] == '#') i++;
-        if (i < len && text[i] == ' ') i++;
-    } else if (text[0] == '>') {
-        i = 1;
-        if (i < len && text[i] == ' ') i++;
-    } else if (text[0] == '-' && len > 1 && text[1] == ' ') {
-        col = 1;
-        i = 2;
+    /*
+     * Measure wrapping using the same screen-column calculation as the
+     * cursor and renderer.  The previous implementation kept a separate
+     * column counter and could disagree with writer_screen_col() after
+     * moving a wrap point back to the previous space.  That caused clipped
+     * words and missing characters.
+     *
+     * For each segment, restart at the exact raw column where the segment
+     * begins.  writer_screen_col() already knows which Markdown characters
+     * are hidden in Writer view, so this avoids maintaining a second parser.
+     */
+    while (seg_start < len && nstarts < MAX_WRAP_ROWS) {
+        base_col = writer_screen_col(text, seg_start);
+        last_space = -1;
+        wrapped = 0;
+
+        for (i = seg_start; i <= len; i++) {
+            screen_col = writer_screen_col(text, i) - base_col;
+
+            if (screen_col >= SCREEN_COLS) {
+                brk = (last_space >= seg_start) ? last_space + 1 : i;
+
+                /* Always make progress, even on an unusually long token. */
+                if (brk <= seg_start) brk = i;
+                if (brk <= seg_start) break;
+
+                starts[nstarts++] = brk;
+                seg_start = brk;
+                wrapped = 1;
+                break;
+            }
+
+            if (i < len && text[i] == ' ') last_space = i;
+        }
+
+        if (!wrapped) break;
     }
 
-    for (; i < len; i++) {
-        if (text[i] == '*' && i + 1 < len && text[i + 1] == '*') { i++; continue; }
-        if (text[i] == '*') continue;
-        if (text[i] == '`') continue;
-        if (text[i] == '~' && i + 1 < len && text[i + 1] == '~') { i++; continue; }
-        if (text[i] == '[') {
-            int j = i + 1;
-            while (j < len && text[j] != ']') j++;
-            if (j < len && j + 1 < len && text[j + 1] == '(') {
-                int k = j + 2, m;
-                while (k < len && text[k] != ')') k++;
-                if (k < len) {
-                    for (m = i + 1; m < j; m++) {
-                        if (col >= SCREEN_COLS && nstarts < MAX_WRAP_ROWS) {
-                            starts[nstarts++] = (last_space >= 0) ? last_space + 1 : m;
-                            col = 0; last_space = -1;
-                        }
-                        col++;
-                    }
-                    i = k;
-                    continue;
-                }
-            }
-        }
-        if (col >= SCREEN_COLS && nstarts < MAX_WRAP_ROWS) {
-            starts[nstarts++] = (last_space >= 0) ? last_space + 1 : i;
-            col = 0; last_space = -1;
-        }
-        if (text[i] == ' ') last_space = i;
-        col++;
-    }
     return nstarts;
 }
 
