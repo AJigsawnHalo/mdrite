@@ -138,7 +138,7 @@ char status_msg[80] = "Ready.";
 char last_search[80] = "";
 int  want_quit = 0;
 
-/* optional vim-lite keymapping (off by default, toggle with Ctrl+V
+/* optional vim-lite keymapping (off by default, toggle with F4
  * or View > Vim Keys). See the file header for exactly what subset
  * of vim this covers -- it's intentionally not a full emulation. */
 int  vim_mode = 0;
@@ -168,7 +168,7 @@ MenuCategory menus[MENU_COUNT] = {
     { "Edit",   0x12, { "Undo       ^Z", "Cut        ^X", "Copy       ^C",
                          "Paste      ^V" }, 4 },
     { "Search", 0x1F, { "Find       ^F", "Find Next  F3", "Go To Line ^G" }, 3 },
-    { "View",   0x2F, { "Toggle View F2", "Vim Keys   ^V" }, 2 }
+    { "View",   0x2F, { "Toggle View F2", "Vim Keys   F4" }, 2 }
 };
 
 int menu_open = -1;
@@ -356,13 +356,19 @@ void do_undo(void)
  * the single-line undo can't represent, so it's invalidated rather
  * than misrepresented. Used directly by cmd_cut, and by cmd_paste
  * so pasting over an active selection replaces it instead of
- * inserting into the middle of it. */
-void sel_delete(void)
+ * inserting into the middle of it.
+ * Returns 1 if it actually deleted something, 0 if it was a no-op
+ * (nothing selected, an active-but-empty selection) or it bailed
+ * out (cross-line selection too long to merge) -- in the 0 cases a
+ * status_msg explaining why has already been set (or left alone,
+ * for the plain "nothing selected" no-op), and callers should not
+ * clobber it with a blanket success message. */
+int sel_delete(void)
 {
     int sl, sc, el, ec, i;
-    if (!sel_active) return;
+    if (!sel_active) return 0;
     sel_bounds(&sl, &sc, &el, &ec);
-    if (sl == el && sc == ec) { sel_clear(); return; }  /* nothing actually selected */
+    if (sl == el && sc == ec) { sel_clear(); return 0; }  /* nothing actually selected */
 
     if (sl == el) {
         Line *l = doc[sl];
@@ -379,7 +385,7 @@ void sel_delete(void)
         if (startl->len + suffix_len > MAX_LINE_LEN) {
             strcpy(status_msg, "Selection too long to delete across lines.");
             sel_clear();
-            return;
+            return 0;
         }
         startl->text[sc] = '\0';
         startl->len = sc;
@@ -395,13 +401,17 @@ void sel_delete(void)
     cur_col = sc;
     sel_clear();
     modified = 1;
+    return 1;
 }
 
-void insert_char(int ch)
+/* Returns 1 on success, 0 if the line was already full (status_msg
+ * is set to explain why in that case). Ordinary typing ignores the
+ * return value; cmd_paste uses it to notice a truncated paste. */
+int insert_char(int ch)
 {
     Line *l = doc[cur_line];
     int i;
-    if (l->len >= MAX_LINE_LEN) { strcpy(status_msg, "Line full."); return; }
+    if (l->len >= MAX_LINE_LEN) { strcpy(status_msg, "Line full."); return 0; }
     sel_clear();
     save_undo(cur_line);
     for (i = l->len; i > cur_col; i--) l->text[i] = l->text[i - 1];
@@ -410,6 +420,7 @@ void insert_char(int ch)
     l->text[l->len] = '\0';
     cur_col++;
     modified = 1;
+    return 1;
 }
 
 void backspace(void)
@@ -477,12 +488,15 @@ void delete_forward(void)
     }
 }
 
-void split_line(void)
+/* Returns 1 on success, 0 if the document was already full
+ * (status_msg is set to explain why in that case). Enter ignores
+ * the return value; cmd_paste uses it to notice a truncated paste. */
+int split_line(void)
 {
     Line *l = doc[cur_line];
     Line *nl;
     int i;
-    if (doc_count >= MAX_LINES) { strcpy(status_msg, "Document full."); return; }
+    if (doc_count >= MAX_LINES) { strcpy(status_msg, "Document full."); return 0; }
     sel_clear();
     nl = new_line();
     strcpy(nl->text, l->text + cur_col);
@@ -496,6 +510,7 @@ void split_line(void)
     cur_col = 0;
     modified = 1;
     undo_line_no = -1;
+    return 1;
 }
 
 /* Removes the whole current line -- used by vim's "dd". Not exposed
@@ -1085,8 +1100,12 @@ void cmd_cut(void)
 {
     if (!sel_active) { strcpy(status_msg, "Nothing selected."); return; }
     cmd_copy();
-    sel_delete();
-    strcpy(status_msg, "Cut.");
+    /* Only claim "Cut." if sel_delete actually removed something.
+     * When it doesn't (an active-but-empty selection, or a
+     * cross-line selection too long to merge) it has already left
+     * an explanatory status_msg -- overwriting that with a blanket
+     * "Cut." would tell the user text was removed when it wasn't. */
+    if (sel_delete()) strcpy(status_msg, "Cut.");
 }
 
 /* Inserts the clipboard at the cursor. A selection active at paste
@@ -1099,14 +1118,18 @@ void cmd_cut(void)
  * keep in sync. */
 void cmd_paste(void)
 {
-    int i;
+    int i, ok = 1;
     if (clip_len == 0) { strcpy(status_msg, "Clipboard empty."); return; }
     if (sel_active) sel_delete();
-    for (i = 0; i < clip_len; i++) {
-        if (clipboard[i] == '\n') split_line();
-        else insert_char((unsigned char) clipboard[i]);
+    for (i = 0; i < clip_len && ok; i++) {
+        if (clipboard[i] == '\n') ok = split_line();
+        else ok = insert_char((unsigned char) clipboard[i]);
     }
-    strcpy(status_msg, "Pasted.");
+    /* Stop and leave split_line/insert_char's own "Line full."/
+     * "Document full." message in place if the paste ran out of
+     * room partway through, rather than papering over a truncated
+     * paste with a blanket "Pasted." */
+    if (ok) strcpy(status_msg, "Pasted.");
 }
 
 void cmd_save_as(void)
