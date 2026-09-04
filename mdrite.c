@@ -11,14 +11,25 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <bios.h>
+
+/* ---------- program identity ---------- */
+/* Bump this by hand before cutting a release build. */
+#define MDRITE_VERSION "v0.1"
+#define MDRITE_NAME    "mdrite"
 
 /* ---------- screen / buffer constants ---------- */
 #define SCREEN_COLS   80
 #define SCREEN_ROWS   25
-#define STATUS_ROW    (SCREEN_ROWS - 2)
+/* Status and menu bars share a single bottom row: normally it shows
+ * the status line, and while a menu is open (Alt held) it swaps to
+ * showing File/Edit/Search/View instead -- see redraw_screen. That
+ * reclaims the row the two used to split, so the editor gets 24
+ * lines of text instead of 23. */
+#define STATUS_ROW    (SCREEN_ROWS - 1)
 #define CMDBAR_ROW    (SCREEN_ROWS - 1)
-#define TEXT_ROWS     (SCREEN_ROWS - 2)
+#define TEXT_ROWS     (SCREEN_ROWS - 1)
 #define MAX_LINE_LEN  1024
 #define MAX_LINES     2000
 
@@ -28,17 +39,37 @@
 #define ATTR_ITALIC      0x0B   /* bright cyan / black */
 #define ATTR_CODE        0x0D   /* bright magenta / black */
 #define ATTR_STRIKE      0x0C   /* bright red / black -- color only, no literal line */
-#define ATTR_HEAD        0x1E   /* bright yellow / blue background */
+#define ATTR_HEAD        0x1E   /* bright yellow / blue background -- H2, kept as
+                                    the legacy name/value so anything still
+                                    referring to ATTR_HEAD keeps working */
+/* Per-level heading colors: same blue background throughout (keeps headings
+ * reading as one family), foreground brightness/hue steps down from H1 to H6
+ * so level is visible at a glance without needing to count '#'s. */
+#define ATTR_HEAD1       0x1F   /* bright white  / blue */
+#define ATTR_HEAD2       0x1E   /* bright yellow / blue */
+#define ATTR_HEAD3       0x1B   /* bright cyan   / blue */
+#define ATTR_HEAD4       0x1A   /* bright green  / blue */
+#define ATTR_HEAD5       0x1D   /* bright magenta/ blue */
+#define ATTR_HEAD6       0x17   /* light grey    / blue */
 #define ATTR_QUOTE       0x5F   /* bright white / magenta background */
 #define ATTR_LINK        0x09   /* bright blue / black */
 #define ATTR_LISTMARK    0x0A   /* bright green / black, bullet glyph only */
 #define ATTR_STATUS      0x70   /* black / light grey */
+#define ATTR_STATUS_FLASH 0x4E  /* bright yellow / red -- reserved for an actual error
+                                    flash. Routine flashes (Saved., Vim keys ON., etc.)
+                                    use the plain ATTR_STATUS background instead, so a
+                                    normal confirmation doesn't read as "something broke" */
 #define ATTR_CMDBAR      0x30   /* black / cyan */
 #define ATTR_CMDBAR_HOT  0x3E   /* bright yellow / cyan -- menu hotkey letter */
 #define ATTR_CMDBAR_SEL  0x4F   /* bright white / red -- open/selected menu (kept
                                     away from 0x70 so it doesn't fuse with the
                                     status bar directly above it) */
 #define ATTR_POPUP       0x1F   /* bright white / blue -- dropdown body */
+#define ATTR_POPUP_HOT   0x1E   /* bright yellow / blue -- dropdown item's mnemonic
+                                    letter, same trick as ATTR_CMDBAR_HOT above but
+                                    for the popup body's background */
+#define ATTR_MODE_NORMAL 0x2F   /* bright white / green  -- vim Normal indicator */
+#define ATTR_MODE_INSERT 0x6F   /* bright white / brown(orange) -- vim Insert indicator */
 
 unsigned char far *video = (unsigned char far *) 0xB8000000L;
 
@@ -55,7 +86,10 @@ int  top_line = 0;
 int  left_col = 0;
 int  modified = 0;
 char filename[80] = "";
-int  view_mode = 0;     /* 0 = Writer (rendered), 1 = raw Markdown */
+int  view_mode = 0;     /* 0 = Rich (rendered), 1 = raw Markdown.
+                            Future home of a third Graphics mode --
+                            keep this as a small int, not a bool,
+                            once that lands. */
 char status_msg[80] = "Ready.";
 char last_search[80] = "";
 int  want_quit = 0;
@@ -81,21 +115,64 @@ typedef struct {
     char label[12];
     unsigned char altkey_scan;   /* BIOS scan code for Alt+<letter> */
     char items[MAX_MENU_ITEMS][20];
+    int  mnemonic_idx[MAX_MENU_ITEMS]; /* index into items[i] of the
+                                           letter highlighted/matched as
+                                           that item's mnemonic -- not
+                                           always item[i][0] (e.g. "Save
+                                           As" highlights the 'A', "Cut"
+                                           highlights the 't') */
     int  item_count;
 } MenuCategory;
 
 MenuCategory menus[MENU_COUNT] = {
     { "File",   0x21, { "New        ^N", "Open       ^O", "Save       ^S",
-                         "Save As    ^A", "Quit       Alt+X" }, 5 },
+                         "Save As    ^A", "Exit       Alt+X" },
+                      { 0, 0, 0, 5, 1 }, 5 },
     { "Edit",   0x12, { "Undo       ^Z", "Cut        ^X", "Copy       ^C",
-                         "Paste      ^V" }, 4 },
-    { "Search", 0x1F, { "Find       ^F", "Find Next  F3", "Go To Line ^G" }, 3 },
-    { "View",   0x2F, { "Toggle View F2", "Vim Keys   F4" }, 2 }
+                         "Paste      ^V" },
+                      { 0, 2, 0, 0 }, 4 },
+    { "Search", 0x1F, { "Find       ^F", "Find Next  F3", "Go To Line ^G" },
+                      { 0, 5, 0 }, 3 },
+    { "View",   0x2F, { "Toggle View F2", "Vim Keys   F4" },
+                      { 0, 0 }, 2 }
 };
 
 int menu_open = -1;
 int menu_sel  = 0;
 int menu_col[MENU_COUNT];
+
+/* Set while Alt is held down with no letter pressed yet -- shows the
+ * menu bar as a preview (no category highlighted) without entering
+ * menu navigation mode. Kept separate from menu_open, which still
+ * means "a specific category is open for arrow-key navigation".
+ * Updated by the polling loop in main(); see alt_down() below for
+ * why a bare Alt press needs polling instead of the usual blocking
+ * key read. */
+int alt_held = 0;
+
+/* Status line messages come in two kinds, both funneled through
+ * status_msg -- see set_status()/flash_status() below:
+ *   sticky: stays put until the next status update (errors, things
+ *           the user needs to actually see and act on)
+ *   flash:  shown on the plain status background for a few seconds,
+ *           then reverts to plain "Ready." on its
+ *           own -- or immediately, the moment any real key comes in,
+ *           whichever happens first (routine confirmations: Saved.,
+ *           Copied., the Vim keys ON/OFF toggle, the startup hint)
+ * flash_expire is a BIOS clock tick count (see 0040:006C, ~18.2
+ * ticks/sec), armed fresh by each flash_status()/flash_status_for()
+ * call. */
+int  flash_active = 0;
+long flash_expire = 0;
+
+/* Sticky error message that also gets a brief attention-flash: the
+ * message itself behaves like set_status() (stays until the next
+ * status update), but for the first FLASH_SECS(5) the bar is drawn
+ * on ATTR_STATUS_FLASH (bright yellow/red) instead of the plain
+ * background, then settles back to plain while status_msg is left
+ * untouched -- see flash_error() below. */
+int  error_flash_active = 0;
+long error_flash_expire = 0;
 
 /* ---------- clipboard ---------- */
 /* Flat buffer holding a copy of the selected text, lines joined with
@@ -179,6 +256,67 @@ int shift_down(void)
     return (_bios_keybrd(_KEYBRD_SHIFTSTATUS) & 0x03) != 0;
 }
 
+/* True if either Alt key is currently held, via the same BIOS flag
+ * byte (bit 3). Unlike Shift, a bare Alt press/release generates no
+ * entry in the keyboard type-ahead buffer, so _bios_keybrd(_KEYBRD_READ)
+ * would just block through it -- the main loop polls this instead of
+ * waiting on a keystroke so the menu-bar preview can track Alt being
+ * held and released on its own. */
+int alt_down(void)
+{
+    return (_bios_keybrd(_KEYBRD_SHIFTSTATUS) & 0x08) != 0;
+}
+
+/* BIOS keyboard ticks (0040:006C) run at ~18.2/sec; this rounds to
+ * 18 so callers can just say FLASH_SECS(2) instead of a raw count. */
+#define FLASH_SECS(n) ((long) (n) * 18L)
+
+/* Sticky status message: replaces status_msg and stays put until the
+ * next set_status()/flash_status() call, drawn on the plain status
+ * background. Use for anything the user needs to actually notice and
+ * may need to act on (errors, "could not ..." messages). */
+void set_status(const char *msg)
+{
+    strcpy(status_msg, msg);
+    flash_active = 0;
+    error_flash_active = 0;
+}
+
+/* Flash status message: shown on the plain status background for
+ * `ticks` BIOS clock ticks (see FLASH_SECS above), then reverts to
+ * plain "Ready." on its own -- or immediately, the
+ * moment any real key comes in, whichever happens first. The actual
+ * reverting happens in main()'s poll loop and keypress handling. */
+void flash_status_for(const char *msg, long ticks)
+{
+    strcpy(status_msg, msg);
+    flash_active = 1;
+    error_flash_active = 0;
+    _bios_timeofday(_TIME_GETCLOCK, &flash_expire);
+    flash_expire += ticks;
+}
+
+/* flash_status_for() with the everyday ~5-second duration. */
+void flash_status(const char *msg)
+{
+    flash_status_for(msg, FLASH_SECS(5));
+}
+
+/* Sticky error message with an attention flash: status_msg is set
+ * and stays put like set_status() -- it does NOT revert to "Ready."
+ * on its own or on the next keystroke -- but the bar's background
+ * flashes ATTR_STATUS_FLASH for FLASH_SECS(5) first, to make sure an
+ * error actually gets noticed, then settles back to the plain
+ * ATTR_STATUS background while the message itself stays put. */
+void flash_error(const char *msg)
+{
+    strcpy(status_msg, msg);
+    flash_active = 0;
+    error_flash_active = 1;
+    _bios_timeofday(_TIME_GETCLOCK, &error_flash_expire);
+    error_flash_expire += FLASH_SECS(5);
+}
+
 /* ================= video primitives ================= */
 
 void put_char(int col, int row, char ch, unsigned char attr)
@@ -256,7 +394,7 @@ void save_undo(int line_no)
 void do_undo(void)
 {
     if (undo_line_no < 0 || undo_line_no >= doc_count) {
-        strcpy(status_msg, "Nothing to undo.");
+        flash_status_for("Nothing to undo.", FLASH_SECS(2));
         return;
     }
     sel_clear();
@@ -265,7 +403,7 @@ void do_undo(void)
     cur_line = undo_line_no;
     cur_col = undo_col;
     undo_line_no = -1;
-    strcpy(status_msg, "Undid last edit.");
+    flash_status("Undid last edit.");
     modified = 1;
 }
 
@@ -305,7 +443,7 @@ int sel_delete(void)
         int suffix_len = endl->len - ec;
         int shift;
         if (startl->len + suffix_len > MAX_LINE_LEN) {
-            strcpy(status_msg, "Selection too long to delete across lines.");
+            flash_error("Selection too long to delete across lines.");
             sel_clear();
             return 0;
         }
@@ -333,7 +471,7 @@ int insert_char(int ch)
 {
     Line *l = doc[cur_line];
     int i;
-    if (l->len >= MAX_LINE_LEN) { strcpy(status_msg, "Line full."); return 0; }
+    if (l->len >= MAX_LINE_LEN) { flash_error("Line full."); return 0; }
     sel_clear();
     save_undo(cur_line);
     for (i = l->len; i > cur_col; i--) l->text[i] = l->text[i - 1];
@@ -365,7 +503,7 @@ void backspace(void)
     prev = doc[cur_line - 1];
     cur  = doc[cur_line];
     if (prev->len + cur->len > MAX_LINE_LEN) {
-        strcpy(status_msg, "Can't merge: line too long.");
+        flash_error("Can't merge: line too long.");
         return;
     }
     {
@@ -418,7 +556,7 @@ int split_line(void)
     Line *l = doc[cur_line];
     Line *nl;
     int i;
-    if (doc_count >= MAX_LINES) { strcpy(status_msg, "Document full."); return 0; }
+    if (doc_count >= MAX_LINES) { flash_error("Document full."); return 0; }
     sel_clear();
     nl = new_line();
     strcpy(nl->text, l->text + cur_col);
@@ -917,12 +1055,21 @@ void render_writer_line(const char *text, int row, int seg_start, int seg_end,
 
     /* heading -- flat attribute, no inline toggles to replay */
     if (text[0] == '#') {
+        static const unsigned char head_attr[6] = {
+            ATTR_HEAD1, ATTR_HEAD2, ATTR_HEAD3, ATTR_HEAD4, ATTR_HEAD5, ATTR_HEAD6
+        };
+        int level;
+        unsigned char hattr;
         i = 0;
         while (i < len && text[i] == '#') i++;
+        level = i;
+        if (level < 1) level = 1;
+        if (level > 6) level = 6;
+        hattr = head_attr[level - 1];
         if (i < len && text[i] == ' ') i++;
         if (seg_start > i) i = seg_start;
         for (; i < len && i < seg_end && col < SCREEN_COLS; i++, col++)
-            put_char(col, row, text[i], apply_sel(ATTR_HEAD, i, sel_start, sel_end));
+            put_char(col, row, text[i], apply_sel(hattr, i, sel_start, sel_end));
         return;
     }
 
@@ -1033,38 +1180,61 @@ void render_writer_line(const char *text, int row, int seg_start, int seg_end,
     }
 }
 
+/* Status bar, laid out like a Neovim statusline:
+ *   [NORMAL/INSERT]  filename* | status msg          Rich  42%  17:6
+ * The mode block only appears while vim_mode is on -- it always shows
+ * whichever sub-mode is current (never faded/hidden away, so it stays
+ * trustworthy at a glance) and sits in its own color, distinct from the
+ * rest of the bar. Everything on the right is right-aligned, same spot
+ * every time regardless of how long the left side gets. */
 void draw_status_bar(void)
 {
-    char buf[SCREEN_COLS + 1];
-    int i;
-    const char *sel_tag = sel_active ? " | Sel" : "";
-    if (vim_mode)
-        sprintf(buf, " %s%s | Ln %d/%d Col %d | %s | VIM:%s%s | %s",
-                filename[0] ? filename : "untitled",
-                modified ? "*" : "",
-                cur_line + 1, doc_count, cur_col + 1,
-                view_mode ? "Markdown" : "Writer",
-                vim_insert ? "Insert" : "Normal",
-                sel_tag,
-                status_msg);
-    else
-        sprintf(buf, " %s%s | Ln %d/%d Col %d | %s%s | %s",
-                filename[0] ? filename : "untitled",
-                modified ? "*" : "",
-                cur_line + 1, doc_count, cur_col + 1,
-                view_mode ? "Markdown" : "Writer",
-                sel_tag,
-                status_msg);
-    buf[SCREEN_COLS] = '\0';
-    put_string(0, STATUS_ROW, buf, ATTR_STATUS);
-    for (i = strlen(buf); i < SCREEN_COLS; i++) put_char(i, STATUS_ROW, ' ', ATTR_STATUS);
+    char left[SCREEN_COLS + 1];
+    char right[32];
+    int col = 0, rlen, rcol, percent;
+    const char *sel_tag = sel_active ? " Sel" : "";
+    /* flash_active only controls how long a routine confirmation
+     * sticks around (see main()'s poll loop) and never affects color.
+     * error_flash_active is the only thing that puts the bar on the
+     * eye-catching ATTR_STATUS_FLASH background, for the first few
+     * seconds of an error message (see flash_error()); once it times
+     * out the bar drops back to plain ATTR_STATUS while status_msg
+     * (the error text) stays displayed. */
+    unsigned char attr = error_flash_active ? ATTR_STATUS_FLASH : ATTR_STATUS;
+
+    clear_row(STATUS_ROW, attr);
+
+    if (vim_mode) {
+        const char *mtxt = vim_insert ? " INSERT " : " NORMAL ";
+        unsigned char mattr = vim_insert ? ATTR_MODE_INSERT : ATTR_MODE_NORMAL;
+        put_string(col, STATUS_ROW, mtxt, mattr);
+        col += (int) strlen(mtxt) + 1;
+    }
+
+    sprintf(left, "%s%s%s | %s",
+            filename[0] ? filename : "untitled",
+            modified ? "*" : "",
+            sel_tag,
+            status_msg);
+    put_string(col, STATUS_ROW, left, attr);
+
+    percent = (doc_count > 1) ? ((cur_line * 100) / (doc_count - 1)) : 100;
+    sprintf(right, "%s  %3d%%  %d:%d",
+            view_mode ? "Markdown" : "Rich",
+            percent, cur_line + 1, cur_col + 1);
+    rlen = (int) strlen(right);
+    rcol = SCREEN_COLS - rlen - 1;
+    if (rcol < col + (int) strlen(left) + 2) rcol = col + (int) strlen(left) + 2;
+    put_string(rcol, STATUS_ROW, right, attr);
 }
 
 /* Bottom row: menu category names, Alt-navigable. Replaces the old
  * static hint line -- same row, interactive now. */
 void draw_menu_bar(void)
 {
-    int i, c = 1;
+    int i, c = 1, rlen;
+    char right[80 + 32];
+    const char *fname = filename[0] ? filename : "untitled";
     clear_row(CMDBAR_ROW, ATTR_CMDBAR);
     for (i = 0; i < MENU_COUNT; i++) {
         unsigned char base = (menu_open == i) ? ATTR_CMDBAR_SEL : ATTR_CMDBAR;
@@ -1074,7 +1244,9 @@ void draw_menu_bar(void)
         put_string(c + 1, CMDBAR_ROW, menus[i].label + 1, base);
         c += (int) strlen(menus[i].label) + 3;
     }
-    put_string(SCREEN_COLS - 9, CMDBAR_ROW, "Alt=Menu", ATTR_CMDBAR);
+    sprintf(right, "%s | %s %s", fname, MDRITE_NAME, MDRITE_VERSION);
+    rlen = (int) strlen(right);
+    put_string(SCREEN_COLS - rlen - 1, CMDBAR_ROW, right, ATTR_CMDBAR);
 }
 
 void draw_menu_popup(void)
@@ -1093,9 +1265,16 @@ void draw_menu_popup(void)
     if (top < 0) top = 0;
 
     for (i = 0; i < m->item_count; i++) {
+        unsigned char base = (i == menu_sel) ? ATTR_CMDBAR_SEL : ATTR_POPUP;
+        /* Selected row is already fully highlighted (ATTR_CMDBAR_SEL),
+         * same as the top bar's own hot-letter-on-selected-category
+         * case, so the mnemonic only needs its own color when the row
+         * ISN'T selected. */
+        unsigned char hot = (i == menu_sel) ? ATTR_CMDBAR_SEL : ATTR_POPUP_HOT;
         r = top + i;
-        fill_rect(col, r, width, (i == menu_sel) ? ATTR_CMDBAR_SEL : ATTR_POPUP);
-        put_string(col + 1, r, m->items[i], (i == menu_sel) ? ATTR_CMDBAR_SEL : ATTR_POPUP);
+        fill_rect(col, r, width, base);
+        put_string(col + 1, r, m->items[i], base);
+        put_char(col + 1 + m->mnemonic_idx[i], r, m->items[i][m->mnemonic_idx[i]], hot);
     }
 }
 
@@ -1143,9 +1322,17 @@ void redraw_screen(void)
         }
     }
 
-    draw_status_bar();
-    draw_menu_bar();
-    if (menu_open >= 0) draw_menu_popup();
+    /* Shared bottom row: menu bar (+ its dropdown) while a menu is
+     * open, status line the rest of the time -- see the STATUS_ROW/
+     * CMDBAR_ROW comment up top. */
+    if (menu_open >= 0) {
+        draw_menu_bar();
+        draw_menu_popup();
+    } else if (alt_held) {
+        draw_menu_bar();   /* preview only -- no category selected/opened */
+    } else {
+        draw_status_bar();
+    }
     {
         int screen_col, screen_row;
         if (view_mode == 1) {
@@ -1250,7 +1437,7 @@ void load_file(const char *fname)
     int i;
     char *raw;
     int raw_len;
-    if (!f) { strcpy(status_msg, "Could not open file."); return; }
+    if (!f) { flash_error("Could not open file."); return; }
     for (i = 0; i < doc_count; i++) free(doc[i]);
     doc_count = 0;
     while (doc_count < MAX_LINES && read_full_line(f, &raw, &raw_len)) {
@@ -1285,19 +1472,19 @@ void load_file(const char *fname)
     modified = 0;
     undo_line_no = -1;
     sel_clear();
-    strcpy(status_msg, "Loaded.");
+    flash_status("Loaded.");
 }
 
 void save_file(const char *fname)
 {
     FILE *f = fopen(fname, "w");
     int i;
-    if (!f) { strcpy(status_msg, "Could not save file."); return; }
+    if (!f) { flash_error("Could not save file."); return; }
     for (i = 0; i < doc_count; i++) fprintf(f, "%s\n", doc[i]->text);
     fclose(f);
     strcpy(filename, fname);
     modified = 0;
-    strcpy(status_msg, "Saved.");
+    flash_status("Saved.");
 }
 
 /* ================= commands ================= */
@@ -1308,9 +1495,9 @@ void save_file(const char *fname)
 void cmd_copy(void)
 {
     int sl, sc, el, ec, ln, from, to, n;
-    if (!sel_active) { strcpy(status_msg, "Nothing selected."); return; }
+    if (!sel_active) { flash_status_for("Nothing selected.", FLASH_SECS(2)); return; }
     sel_bounds(&sl, &sc, &el, &ec);
-    if (sl == el && sc == ec) { strcpy(status_msg, "Nothing selected."); return; }
+    if (sl == el && sc == ec) { flash_status_for("Nothing selected.", FLASH_SECS(2)); return; }
 
     clip_len = 0;
     for (ln = sl; ln <= el; ln++) {
@@ -1326,19 +1513,19 @@ void cmd_copy(void)
         if (ln < el && clip_len < CLIP_MAX - 1) clipboard[clip_len++] = '\n';
     }
     clipboard[clip_len] = '\0';
-    strcpy(status_msg, "Copied.");
+    flash_status("Copied.");
 }
 
 void cmd_cut(void)
 {
-    if (!sel_active) { strcpy(status_msg, "Nothing selected."); return; }
+    if (!sel_active) { flash_status_for("Nothing selected.", FLASH_SECS(2)); return; }
     cmd_copy();
     /* Only claim "Cut." if sel_delete actually removed something.
      * When it doesn't (an active-but-empty selection, or a
      * cross-line selection too long to merge) it has already left
      * an explanatory status_msg -- overwriting that with a blanket
      * "Cut." would tell the user text was removed when it wasn't. */
-    if (sel_delete()) strcpy(status_msg, "Cut.");
+    if (sel_delete()) flash_status("Cut.");
 }
 
 /* Inserts the clipboard at the cursor. A selection active at paste
@@ -1352,7 +1539,7 @@ void cmd_cut(void)
 void cmd_paste(void)
 {
     int i, ok = 1;
-    if (clip_len == 0) { strcpy(status_msg, "Clipboard empty."); return; }
+    if (clip_len == 0) { flash_status_for("Clipboard empty.", FLASH_SECS(2)); return; }
     if (sel_active) sel_delete();
     for (i = 0; i < clip_len && ok; i++) {
         if (clipboard[i] == '\n') ok = split_line();
@@ -1362,7 +1549,7 @@ void cmd_paste(void)
      * "Document full." message in place if the paste ran out of
      * room partway through, rather than papering over a truncated
      * paste with a blanket "Pasted." */
-    if (ok) strcpy(status_msg, "Pasted.");
+    if (ok) flash_status("Pasted.");
 }
 
 void cmd_save_as(void)
@@ -1382,7 +1569,7 @@ void cmd_new(void)
     if (modified && !confirm("Discard unsaved changes? (Y/N)")) return;
     doc_reset();
     filename[0] = '\0';
-    strcpy(status_msg, "New file.");
+    flash_status("New file.");
 }
 
 void cmd_open(void)
@@ -1415,18 +1602,18 @@ void cmd_find(void)
     if (!prompt_input("Find: ", buf, sizeof(buf)) || !buf[0]) return;
     strcpy(last_search, buf);
     if (find_from(cur_line, cur_col + 1, buf) || find_from(0, 0, buf))
-        strcpy(status_msg, "Found.");
+        flash_status("Found.");
     else
-        strcpy(status_msg, "Not found.");
+        flash_status("Not found.");
 }
 
 void cmd_find_next(void)
 {
     if (!last_search[0]) { cmd_find(); return; }
     if (find_from(cur_line, cur_col + 1, last_search) || find_from(0, 0, last_search))
-        strcpy(status_msg, "Found.");
+        flash_status("Found.");
     else
-        strcpy(status_msg, "Not found.");
+        flash_status("Not found.");
 }
 
 void cmd_goto(void)
@@ -1451,7 +1638,7 @@ void toggle_vim_mode(void)
     vim_mode = !vim_mode;
     vim_insert = 0;    /* always start in Normal sub-mode when turning it on */
     vim_pending = 0;
-    strcpy(status_msg, vim_mode ? "Vim keys ON." : "Vim keys OFF.");
+    flash_status(vim_mode ? "Vim keys ON." : "Vim keys OFF.");
 }
 
 /* Minimal ":" command line: :w save, :q quit, :wq save+quit,
@@ -1464,7 +1651,7 @@ void vim_command_line(void)
     else if (strcmp(buf, "q") == 0) cmd_quit_request();
     else if (strcmp(buf, "wq") == 0) { cmd_save(); want_quit = 1; }
     else if (strcmp(buf, "q!") == 0) want_quit = 1;
-    else strcpy(status_msg, "Unknown command.");
+    else flash_error("Unknown command.");
 }
 
 void execute_menu_item(int cat, int idx)
@@ -1507,8 +1694,64 @@ int main(int argc, char **argv)
 
     clear_screen(ATTR_NORMAL);
 
+    flash_status("Hold Alt for the menu bar");
+
     for (;;) {
         redraw_screen();
+
+        /* No key is waiting yet: keep polling, redrawing only when
+         * Alt's held/released state actually changes, so the menu
+         * bar preview appears the instant Alt goes down and the
+         * status bar comes back the instant it's released -- with
+         * no keystroke required either way. Same poll also clears
+         * a flash message once its timer runs out. */
+        while (!_bios_keybrd(_KEYBRD_READY)) {
+            int now_alt = alt_down();
+            if (now_alt != alt_held) {
+                alt_held = now_alt;
+                redraw_screen();
+            }
+            if (flash_active) {
+                long now;
+                _bios_timeofday(_TIME_GETCLOCK, &now);
+                if (now >= flash_expire) {
+                    flash_active = 0;
+                    strcpy(status_msg, "Ready.");
+                    redraw_screen();
+                }
+            }
+            if (error_flash_active) {
+                long now;
+                _bios_timeofday(_TIME_GETCLOCK, &now);
+                if (now >= error_flash_expire) {
+                    /* Just drop the attention-flash color -- the error
+                     * text in status_msg is sticky and stays put. */
+                    error_flash_active = 0;
+                    redraw_screen();
+                }
+            }
+        }
+        alt_held = 0;
+        if (flash_active) {
+            /* Any real keystroke dismisses a flash message right
+             * away too, even if the 5 seconds haven't elapsed --
+             * whatever the key goes on to do below (including
+             * starting a new flash of its own, e.g. F4) is free to
+             * set its own status_msg afterward, same as normal. */
+            flash_active = 0;
+            strcpy(status_msg, "Ready.");
+        }
+        if (error_flash_active) {
+            /* Unlike a routine flash, the error's attention-color is
+             * NOT cut short by a keystroke -- it always gets its full
+             * FLASH_SECS(5) to be noticed. Typing fast enough to skip
+             * the poll loop above just means we check the clock here
+             * instead; the message itself was never going anywhere. */
+            long now;
+            _bios_timeofday(_TIME_GETCLOCK, &now);
+            if (now >= error_flash_expire) error_flash_active = 0;
+        }
+
         key = _bios_keybrd(_KEYBRD_READ);
         lo = key & 0xFF;
         hi = (key >> 8) & 0xFF;
@@ -1545,6 +1788,23 @@ int main(int argc, char **argv)
                             }
                         }
                         break;
+                }
+            } else {
+                /* Any other (non-Alt) key: check it against this menu's
+                 * mnemonic letters -- typing the highlighted letter runs
+                 * that item immediately, same as arrowing to it and
+                 * pressing Enter. Arrow/Enter/Esc handling above already
+                 * covers everything else, so this only ever sees plain
+                 * character keys. */
+                MenuCategory *m = &menus[menu_open];
+                int typed = tolower((unsigned char) lo);
+                for (k = 0; k < m->item_count; k++) {
+                    int letter = tolower((unsigned char) m->items[k][m->mnemonic_idx[k]]);
+                    if (letter == typed) {
+                        execute_menu_item(menu_open, k);
+                        menu_open = -1;
+                        break;
+                    }
                 }
             }
             if (want_quit) break;
