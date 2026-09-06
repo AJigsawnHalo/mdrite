@@ -33,6 +33,13 @@
 #define MAX_LINE_LEN  1024
 #define MAX_LINES     2000
 
+/* Max word-wrapped visual rows a single buffer line can occupy in
+ * Writer view. Moved up here (was previously defined just above
+ * compute_wrap_starts) so it's available to the Line struct below,
+ * which now carries a small per-line wrap cache -- see the
+ * "wrap_starts/wrap_nstarts/wrap_dirty" comment on Line. */
+#define MAX_WRAP_ROWS 16
+
 /* ---------- color attributes ---------- */
 #define ATTR_NORMAL      0x07   /* light grey / black */
 #define ATTR_BOLD        0x0F   /* bright white / black */
@@ -73,9 +80,30 @@
 
 unsigned char far *video = (unsigned char far *) 0xB8000000L;
 
+/* Forward declarations: do_move() (defined in the cursor-movement
+ * section) needs scroll_to_cursor() before its own definition
+ * further down that same section, and redraw_line_only() (rendering
+ * section) falls back to redraw_screen() defined right after it. */
+void scroll_to_cursor(void);
+void redraw_screen(void);
+
 typedef struct {
     char text[MAX_LINE_LEN + 1];
     int  len;
+    /* Cached Writer-view word-wrap row-start offsets for this line,
+     * as compute_wrap_starts() would return them. Wrap only depends
+     * on a line's own text, never on other lines, scroll position,
+     * or the cursor -- so it's safe to compute once and reuse across
+     * every redraw until the line is actually edited. wrap_dirty is
+     * set by line_mark_dirty() everywhere a line's text[] changes,
+     * and cleared by get_line_wraps() the next time it recomputes.
+     * Because the cache lives on the Line itself (not indexed by
+     * line number), it automatically travels along for free whenever
+     * lines are shifted around in doc[] (insert/delete line, undo,
+     * etc.) -- nothing else needs to know the cache exists. */
+    int  wrap_starts[MAX_WRAP_ROWS];
+    int  wrap_nstarts;
+    int  wrap_dirty;
 } Line;
 
 Line *doc[MAX_LINES];
@@ -94,12 +122,58 @@ char status_msg[80] = "Ready.";
 char last_search[80] = "";
 int  want_quit = 0;
 
+/* Redraw request state for the current keystroke, consumed once at
+ * the top of main()'s loop:
+ *   0        - nothing changed, skip the redraw entirely (a key that
+ *              turned out to be a no-op: an arrow at the edge of the
+ *              document, an unrecognized vim command that gets
+ *              swallowed, etc.)
+ *   1 (full) - repaint the whole viewport + status/menu bar, via
+ *              redraw_screen(). Used for anything that can move text
+ *              on more than one line: scrolling, inserting/removing
+ *              a whole line, merging lines, view/vim mode toggles,
+ *              menu actions, load/new file, undo, a selection being
+ *              highlighted/cleared (its highlight can span several
+ *              lines), etc.
+ *   2 (line) - only buffer line dirty_line_no changed, and nothing
+ *              else on screen needs to move (its wrapped row count
+ *              didn't change and no scrolling was needed) -- redraw
+ *              just that line's on-screen row(s) plus the status bar
+ *              via redraw_line_only(). This is what makes ordinary
+ *              typing/backspacing/deleting a character cheap: it's
+ *              by far the most frequent edit, and normally only
+ *              touches 1-2 screen rows out of TEXT_ROWS (24).
+ * Always request through request_full_redraw()/request_line_redraw()
+ * below rather than setting screen_dirty directly, so a "line" request
+ * never silently downgrades an already-pending "full" one. */
+int screen_dirty = 1;
+int dirty_line_no = -1;
+
+void request_full_redraw(void)
+{
+    screen_dirty = 1;
+}
+
+/* Requests a cheap single-line redraw for `line_no`. If a full
+ * redraw is already pending this keystroke, or a DIFFERENT line was
+ * already requested, this upgrades to a full redraw instead of
+ * guessing which lines to combine -- callers that know an edit is
+ * confined to exactly one line (see redraw_after_char_edit below)
+ * are the only ones that should call this. */
+void request_line_redraw(int line_no)
+{
+    if (screen_dirty == 1) return;
+    if (screen_dirty == 2 && dirty_line_no != line_no) { screen_dirty = 1; return; }
+    screen_dirty = 2;
+    dirty_line_no = line_no;
+}
+
 /* optional vim-lite keymapping (off by default, toggle with F4
  * or View > Vim Keys). See the file header for exactly what subset
  * of vim this covers -- it's intentionally not a full emulation. */
-int  vim_mode = 0;
-int  vim_insert = 0;    /* 0 = Normal sub-mode, 1 = Insert sub-mode */
-int  vim_pending = 0;   /* holds the first key of a two-key command, e.g. 'd' of dd */
+int vim_mode = 0;
+int vim_insert = 0;    /* 0 = Normal sub-mode, 1 = Insert sub-mode */
+int vim_pending = 0;   /* holds the first key of a two-key command, e.g. 'd' of dd */
 
 /* single-level undo: remembers ONE line's previous contents.
  * See the file header for what it does and doesn't cover. */
@@ -280,6 +354,7 @@ void set_status(const char *msg)
     strcpy(status_msg, msg);
     flash_active = 0;
     error_flash_active = 0;
+    request_full_redraw();
 }
 
 /* Flash status message: shown on the plain status background for
@@ -294,6 +369,7 @@ void flash_status_for(const char *msg, long ticks)
     error_flash_active = 0;
     _bios_timeofday(_TIME_GETCLOCK, &flash_expire);
     flash_expire += ticks;
+    request_full_redraw();
 }
 
 /* flash_status_for() with the everyday ~5-second duration. */
@@ -315,17 +391,45 @@ void flash_error(const char *msg)
     error_flash_active = 1;
     _bios_timeofday(_TIME_GETCLOCK, &error_flash_expire);
     error_flash_expire += FLASH_SECS(5);
+    request_full_redraw();
 }
 
 /* ================= video primitives ================= */
 
+/* Cell value for a glyph+attribute pair, as it sits in video memory:
+ * character in the low byte, attribute in the high byte. Writing
+ * this as one 16-bit far store is one far-pointer access instead of
+ * two -- far writes aren't free on real-mode 8086/286 (segment
+ * handling), so halving the count of them helps on every hot path
+ * below. */
+#define CELL(ch, attr) ((unsigned int) (unsigned char) (ch) | ((unsigned int) (attr) << 8))
+
+/* Row base address, as an unsigned-int (cell-sized) far pointer --
+ * indexing into this with [col] lands on the right byte pair without
+ * a general multiply (col*2 as a pointer offset compiles to a cheap
+ * shift, not a multiply routine, unlike the row*SCREEN_COLS multiply
+ * this factors out). Callers that touch many cells in one row should
+ * call this ONCE and then index/increment through it, rather than
+ * recomputing a row's address (or worse, calling put_char, which
+ * redoes the multiply AND a bounds check) for every glyph -- that
+ * per-glyph multiply was the actual cost on an 8086/286, where an
+ * integer multiply is dozens of cycles, run for every character of
+ * every row on every redraw. */
+unsigned int far *row_ptr(int row)
+{
+    return (unsigned int far *) (video + (long) row * SCREEN_COLS * 2);
+}
+
+/* Safe, bounds-checked single-glyph write for the scattered,
+ * non-hot-loop call sites (menu bar/popup, status bar, prompt line --
+ * places drawing a handful of characters at a time, not a whole
+ * 80-column row). Hot per-row loops (render_line, render_writer_line,
+ * fill_rect) bypass this and write straight through row_ptr()
+ * instead -- see their own comments. */
 void put_char(int col, int row, char ch, unsigned char attr)
 {
-    int off;
     if (col < 0 || col >= SCREEN_COLS || row < 0 || row >= SCREEN_ROWS) return;
-    off = (row * SCREEN_COLS + col) * 2;
-    video[off] = (unsigned char) ch;
-    video[off + 1] = attr;
+    row_ptr(row)[col] = CELL(ch, attr);
 }
 
 void put_string(int col, int row, const char *s, unsigned char attr)
@@ -334,10 +438,23 @@ void put_string(int col, int row, const char *s, unsigned char attr)
     for (i = 0; s[i]; i++) put_char(col + i, row, s[i], attr);
 }
 
+/* Blanks [col, col+w) of `row` with `attr`. Computes the row's base
+ * pointer once, then writes through it with a plain incrementing
+ * pointer -- no put_char, so no per-cell multiply or bounds check;
+ * the clamping below establishes the safe range once, up front,
+ * instead of on every cell. */
 void fill_rect(int col, int row, int w, unsigned char attr)
 {
-    int c;
-    for (c = 0; c < w; c++) put_char(col + c, row, ' ', attr);
+    unsigned int far *rp;
+    unsigned int cell;
+    int start = col, end = col + w;
+    if (row < 0 || row >= SCREEN_ROWS) return;
+    if (start < 0) start = 0;
+    if (end > SCREEN_COLS) end = SCREEN_COLS;
+    if (start >= end) return;
+    rp = row_ptr(row) + start;
+    cell = CELL(' ', attr);
+    while (start < end) { *rp++ = cell; start++; }
 }
 
 void clear_row(int row, unsigned char attr) { fill_rect(0, row, SCREEN_COLS, attr); }
@@ -365,7 +482,19 @@ Line *new_line(void)
     Line *l = (Line *) malloc(sizeof(Line));
     l->text[0] = '\0';
     l->len = 0;
+    l->wrap_nstarts = 0;
+    l->wrap_dirty = 1;   /* nothing cached yet */
     return l;
+}
+
+/* Call this on any Line* whose text[] just changed -- invalidates
+ * its cached word-wrap so the next get_line_wraps() call for it
+ * recomputes instead of serving a stale cache. See the wrap_dirty
+ * comment on Line for why this is safe to do liberally: wrap only
+ * depends on a line's own text. */
+void line_mark_dirty(Line *l)
+{
+    if (l) l->wrap_dirty = 1;
 }
 
 void doc_reset(void)
@@ -400,6 +529,7 @@ void do_undo(void)
     sel_clear();
     strcpy(doc[undo_line_no]->text, undo_line.text);
     doc[undo_line_no]->len = undo_line.len;
+    line_mark_dirty(doc[undo_line_no]);
     cur_line = undo_line_no;
     cur_col = undo_col;
     undo_line_no = -1;
@@ -434,9 +564,12 @@ int sel_delete(void)
         Line *l = doc[sl];
         int n = ec - sc;
         save_undo(sl);
-        for (i = sc; i < l->len - n; i++) l->text[i] = l->text[i + n];
+        /* shifts text[sc+n..len] (terminator included) left by n --
+         * memmove instead of a per-byte loop, see insert_char's
+         * comment for why */
+        memmove(l->text + sc, l->text + sc + n, (size_t) (l->len - n - sc + 1));
         l->len -= n;
-        l->text[l->len] = '\0';
+        line_mark_dirty(l);
     } else {
         Line *startl = doc[sl];
         Line *endl = doc[el];
@@ -451,9 +584,10 @@ int sel_delete(void)
         startl->len = sc;
         strcat(startl->text, endl->text + ec);
         startl->len += suffix_len;
+        line_mark_dirty(startl);
         for (i = sl + 1; i <= el; i++) free(doc[i]);
         shift = el - sl;
-        for (i = el + 1; i < doc_count; i++) doc[i - shift] = doc[i];
+        memmove(&doc[sl + 1], &doc[el + 1], (size_t) (doc_count - el - 1) * sizeof(Line *));
         doc_count -= shift;
         undo_line_no = -1;  /* spans lines: not representable by single-line undo */
     }
@@ -461,39 +595,53 @@ int sel_delete(void)
     cur_col = sc;
     sel_clear();
     modified = 1;
+    request_full_redraw();
     return 1;
 }
 
 /* Returns 1 on success, 0 if the line was already full (status_msg
  * is set to explain why in that case). Ordinary typing ignores the
- * return value; cmd_paste uses it to notice a truncated paste. */
+ * return value; cmd_paste uses it to notice a truncated paste.
+ *
+ * Does NOT request a redraw itself -- callers decide the scope (see
+ * do_insert_char() below, which is what every real key-dispatch site
+ * should call instead of this directly; cmd_paste calls this raw and
+ * relies on its own trailing flash_status() to trigger one redraw
+ * for the whole paste instead of one per character). */
 int insert_char(int ch)
 {
     Line *l = doc[cur_line];
-    int i;
     if (l->len >= MAX_LINE_LEN) { flash_error("Line full."); return 0; }
     sel_clear();
     save_undo(cur_line);
-    for (i = l->len; i > cur_col; i--) l->text[i] = l->text[i - 1];
+    /* Shift text[cur_col..len-1] (and the terminator) one byte right
+     * to open a gap at cur_col. A hand-written byte-at-a-time loop
+     * here used to cost one iteration's worth of loop overhead per
+     * character shifted; memmove compiles to a block-copy routine
+     * (rep movsb/movsw on most 16-bit DOS compilers) instead. */
+    memmove(l->text + cur_col + 1, l->text + cur_col, (size_t) (l->len - cur_col + 1));
     l->text[cur_col] = (char) ch;
     l->len++;
-    l->text[l->len] = '\0';
+    line_mark_dirty(l);
     cur_col++;
     modified = 1;
     return 1;
 }
 
+/* Does NOT request a redraw itself for the common intra-line case --
+ * see do_backspace() below. The line-merge case still requests a
+ * full redraw directly, since merging always affects more than one
+ * line. */
 void backspace(void)
 {
     Line *prev, *cur;
-    int i;
     sel_clear();
     if (cur_col > 0) {
         Line *l = doc[cur_line];
         save_undo(cur_line);
-        for (i = cur_col - 1; i < l->len - 1; i++) l->text[i] = l->text[i + 1];
+        memmove(l->text + cur_col - 1, l->text + cur_col, (size_t) (l->len - cur_col + 1));
         l->len--;
-        l->text[l->len] = '\0';
+        line_mark_dirty(l);
         cur_col--;
         modified = 1;
         return;
@@ -510,39 +658,46 @@ void backspace(void)
         int newcol = prev->len;
         strcat(prev->text, cur->text);
         prev->len += cur->len;
+        line_mark_dirty(prev);
         free(cur);
-        for (i = cur_line; i < doc_count - 1; i++) doc[i] = doc[i + 1];
+        memmove(&doc[cur_line], &doc[cur_line + 1],
+                (size_t) (doc_count - 1 - cur_line) * sizeof(Line *));
         doc_count--;
         cur_line--;
         cur_col = newcol;
         modified = 1;
+        request_full_redraw();
         undo_line_no = -1;
     }
 }
 
+/* Does NOT request a redraw itself for the common intra-line case --
+ * see do_delete_forward() below. The line-merge case still requests
+ * a full redraw directly. */
 void delete_forward(void)
 {
     Line *l = doc[cur_line];
-    int i;
     sel_clear();
     if (cur_col < l->len) {
         save_undo(cur_line);
-        for (i = cur_col; i < l->len - 1; i++) l->text[i] = l->text[i + 1];
+        memmove(l->text + cur_col, l->text + cur_col + 1, (size_t) (l->len - cur_col));
         l->len--;
-        l->text[l->len] = '\0';
+        line_mark_dirty(l);
         modified = 1;
         return;
     }
     if (cur_line < doc_count - 1) {
         Line *next = doc[cur_line + 1];
-        int i2;
         if (l->len + next->len <= MAX_LINE_LEN) {
             strcat(l->text, next->text);
             l->len += next->len;
+            line_mark_dirty(l);
             free(next);
-            for (i2 = cur_line + 1; i2 < doc_count - 1; i2++) doc[i2] = doc[i2 + 1];
+            memmove(&doc[cur_line + 1], &doc[cur_line + 2],
+                    (size_t) (doc_count - 2 - cur_line) * sizeof(Line *));
             doc_count--;
             modified = 1;
+            request_full_redraw();
             undo_line_no = -1;
         }
     }
@@ -555,7 +710,6 @@ int split_line(void)
 {
     Line *l = doc[cur_line];
     Line *nl;
-    int i;
     if (doc_count >= MAX_LINES) { flash_error("Document full."); return 0; }
     sel_clear();
     nl = new_line();
@@ -563,12 +717,15 @@ int split_line(void)
     nl->len = l->len - cur_col;
     l->text[cur_col] = '\0';
     l->len = cur_col;
-    for (i = doc_count; i > cur_line + 1; i--) doc[i] = doc[i - 1];
+    line_mark_dirty(l);   /* nl is already dirty fresh out of new_line() */
+    memmove(&doc[cur_line + 2], &doc[cur_line + 1],
+            (size_t) (doc_count - cur_line - 1) * sizeof(Line *));
     doc[cur_line + 1] = nl;
     doc_count++;
     cur_line++;
     cur_col = 0;
     modified = 1;
+    request_full_redraw();
     undo_line_no = -1;
     return 1;
 }
@@ -579,21 +736,24 @@ int split_line(void)
  * can't represent, so it invalidates it rather than misrepresenting it. */
 void delete_current_line(void)
 {
-    int i;
     sel_clear();
     if (doc_count <= 1) {
         doc[0]->text[0] = '\0';
         doc[0]->len = 0;
+        line_mark_dirty(doc[0]);
         cur_col = 0;
         modified = 1;
+        request_full_redraw();
         return;
     }
     free(doc[cur_line]);
-    for (i = cur_line; i < doc_count - 1; i++) doc[i] = doc[i + 1];
+    memmove(&doc[cur_line], &doc[cur_line + 1],
+            (size_t) (doc_count - cur_line - 1) * sizeof(Line *));
     doc_count--;
     if (cur_line >= doc_count) cur_line = doc_count - 1;
     cur_col = 0;
     modified = 1;
+    request_full_redraw();
     undo_line_no = -1;
 }
 
@@ -613,7 +773,16 @@ void delete_current_line(void)
  * clean over the whole link in one step, same as they now do for
  * bold/italic/etc. Worth fixing properly if that turns out to
  * matter in practice -- it would need this function to walk the
- * label's characters individually instead of returning early. */
+ * label's characters individually instead of returning early.
+ *
+ * This is still the function used for one-off "where is raw column
+ * X on screen" queries (cursor placement after a single Left/Right
+ * step, rendering). For anything that needs the answer for MANY
+ * columns of the SAME line at once (word wrap, vertical cursor
+ * movement across a wrap), use build_screen_col_table() below
+ * instead -- calling this in a loop over every column of a line is
+ * exactly the O(len^2) pattern that used to make word wrap slow on
+ * long lines. */
 int writer_screen_col(const char *text, int raw_col)
 {
     int i = 0, col = 0, len = (int) strlen(text);
@@ -671,6 +840,111 @@ int writer_screen_col(const char *text, int raw_col)
     return col;
 }
 
+/* Builds, in a single O(len) forward pass, a table mapping every raw
+ * column 0..len of `text` to the Writer-view screen column that
+ * writer_screen_col(text, that_column) would return -- same rules
+ * (heading/blockquote prefix, list bullet, bold/italic/code/strike
+ * delimiters hidden, [link](url) collapsing to one column), just
+ * computed once for the whole line instead of re-walking from column
+ * 0 for every query. `table` must have room for len+1 ints (indices
+ * 0..len inclusive); it's meant to be a transient, stack/static
+ * scratch buffer supplied by the caller, NOT something stored per
+ * line -- a full int-per-column table would be a few KB per line,
+ * which adds up fast against DOS's tight conventional memory once
+ * you multiply by a document's worth of lines. (The per-line cache
+ * that IS kept around, wrap_starts[], is only a handful of ints --
+ * see the comment on Line.)
+ * Returns len.
+ *
+ * This is the fix for the #1 hotspot: compute_wrap_starts() and
+ * col_for_target_screen() used to call writer_screen_col() -- itself
+ * an O(len) scan from column 0 -- once per candidate column, making
+ * wrap computation O(len^2) per line. Both now build this table once
+ * (O(len)) and do O(1) lookups into it instead. */
+int build_screen_col_table(const char *text, int *table)
+{
+    int len = (int) strlen(text);
+    int i, col;
+
+    if (len >= 3) {
+        int all_dash = 1, ii;
+        for (ii = 0; ii < len; ii++) if (text[ii] != '-') { all_dash = 0; break; }
+        if (all_dash) {
+            for (i = 0; i <= len; i++) table[i] = i;
+            return len;
+        }
+    }
+
+    if (text[0] == '#') {
+        int prefix = 0;
+        while (prefix < len && text[prefix] == '#') prefix++;
+        if (prefix < len && text[prefix] == ' ') prefix++;
+        for (i = 0; i <= len; i++) table[i] = (i <= prefix) ? 0 : i - prefix;
+        return len;
+    }
+
+    if (text[0] == '>') {
+        int prefix = 1;
+        if (prefix < len && text[prefix] == ' ') prefix++;
+        for (i = 0; i <= len; i++) table[i] = (i <= prefix) ? 0 : i - prefix;
+        return len;
+    }
+
+    i = 0; col = 0;
+    table[0] = 0;
+    if (text[0] == '-' && len > 1 && text[1] == ' ') {
+        if (len >= 1) table[1] = 0;
+        col = 1;
+        i = 2;
+        if (i <= len) table[i] = col;
+    }
+
+    while (i < len) {
+        int i_start = i;
+        if (text[i] == '*' && i + 1 < len && text[i + 1] == '*') {
+            i += 2;
+        } else if (text[i] == '*') {
+            i += 1;
+        } else if (text[i] == '`') {
+            i += 1;
+        } else if (text[i] == '~' && i + 1 < len && text[i + 1] == '~') {
+            i += 2;
+        } else if (text[i] == '[') {
+            int j = i_start + 1;
+            while (j < len && text[j] != ']') j++;
+            if (j < len && j + 1 < len && text[j + 1] == '(') {
+                int k = j + 2, m;
+                while (k < len && text[k] != ')') k++;
+                if (k < len) {
+                    /* every raw column from just past '[' through the
+                     * closing ')' collapses to the pre-link column --
+                     * mirrors writer_screen_col's "if (raw_col <= k)
+                     * return col" early-out */
+                    for (m = i_start + 1; m <= k; m++) table[m] = col;
+                    col += (j - (i_start + 1));   /* label length */
+                    i = k + 1;
+                    if (i <= len) table[i] = col;
+                    continue;
+                }
+            }
+            /* '[' with no valid following (label)(url): ordinary char */
+            i = i_start + 1;
+            col++;
+            if (i <= len) table[i] = col;
+            continue;
+        } else {
+            i = i_start + 1;
+            col++;
+            if (i <= len) table[i] = col;
+            continue;
+        }
+        /* hidden delimiter (bold/italic/code/strike): every raw column
+         * it spans maps to the same col -- these never change col */
+        { int m; for (m = i_start + 1; m <= i && m <= len; m++) table[m] = col; }
+    }
+    return len;
+}
+
 /* Right-arrow step for Writer view: advances raw_col past however
  * many raw characters share the current screen column (i.e. past a
  * whole hidden run -- a heading/blockquote prefix, a list bullet's
@@ -705,7 +979,13 @@ int writer_move_left(const char *text, int raw_col)
 
 /* ================= word wrap (Writer view only) ================= */
 
-#define MAX_WRAP_ROWS 16
+/* Scratch buffer for build_screen_col_table(), reused across calls
+ * instead of a MAX_LINE_LEN-sized array on the stack each time
+ * (stack space is precious in DOS's small/medium/large-model, no-MMU
+ * world). Fine to share as one global: compute_wrap_starts() and
+ * col_for_target_screen() each fill it and consume it before
+ * returning, with no reentrancy between those fill/consume pairs. */
+static int g_col_table[MAX_LINE_LEN + 1];
 
 /* Raw-column offsets at which each wrapped visual row of `text`
  * begins, when rendered in Writer view at SCREEN_COLS width.
@@ -722,7 +1002,19 @@ int writer_move_left(const char *text, int raw_col)
  * did, it prefers the most recent space, giving real word-wrap
  * instead of a mid-word chop. A run with no space to break at (e.g.
  * one very long "word") still hard-breaks at the column limit, same
- * as before. */
+ * as before.
+ *
+ * Screen columns for every raw column of `text` are computed ONCE up
+ * front via build_screen_col_table() (O(len)), then looked up here
+ * with plain array indexing -- this used to call writer_screen_col()
+ * (itself an O(len) from-scratch scan) once per candidate column,
+ * which made this function O(len^2) per line. See that function's
+ * comment for the full story; this was the #1 hotspot fix.
+ *
+ * Most callers don't want this called at all if the line hasn't
+ * changed since last time -- see get_line_wraps() below, which wraps
+ * this with a per-line cache and is what everything except this
+ * function itself should call. */
 int compute_wrap_starts(const char *text, int *starts)
 {
     int len = (int) strlen(text);
@@ -738,24 +1030,15 @@ int compute_wrap_starts(const char *text, int *starts)
         if (all_dash) return 1;   /* horizontal rule: always one row */
     }
 
-    /*
-     * Measure wrapping using the same screen-column calculation as the
-     * cursor and renderer.  The previous implementation kept a separate
-     * column counter and could disagree with writer_screen_col() after
-     * moving a wrap point back to the previous space.  That caused clipped
-     * words and missing characters.
-     *
-     * For each segment, restart at the exact raw column where the segment
-     * begins.  writer_screen_col() already knows which Markdown characters
-     * are hidden in Writer view, so this avoids maintaining a second parser.
-     */
+    build_screen_col_table(text, g_col_table);
+
     while (seg_start < len && nstarts < MAX_WRAP_ROWS) {
-        base_col = writer_screen_col(text, seg_start);
+        base_col = g_col_table[seg_start];
         last_space = -1;
         wrapped = 0;
 
         for (i = seg_start; i <= len; i++) {
-            screen_col = writer_screen_col(text, i) - base_col;
+            screen_col = g_col_table[i] - base_col;
 
             if (screen_col >= SCREEN_COLS) {
                 brk = (last_space >= seg_start) ? last_space + 1 : i;
@@ -779,6 +1062,29 @@ int compute_wrap_starts(const char *text, int *starts)
     return nstarts;
 }
 
+/* Cache-aware front end for compute_wrap_starts(): returns line
+ * `line_no`'s wrap starts, recomputing only if that Line's text has
+ * changed since the cache was last filled (wrap_dirty, set by
+ * line_mark_dirty() from every place that mutates a line's text --
+ * see the comment on Line). This is what makes repeated per-redraw,
+ * per-arrow-key wrap queries for an UNCHANGED line effectively free
+ * (an array copy) instead of redoing the O(len) scan every time --
+ * on a full-screen redraw, only lines that actually changed since
+ * the last frame do any wrap work at all. Every call site that used
+ * to call compute_wrap_starts(doc[N]->text, ...) directly should call
+ * this instead. */
+int get_line_wraps(int line_no, int *starts)
+{
+    Line *l = doc[line_no];
+    int i;
+    if (l->wrap_dirty) {
+        l->wrap_nstarts = compute_wrap_starts(l->text, l->wrap_starts);
+        l->wrap_dirty = 0;
+    }
+    for (i = 0; i < l->wrap_nstarts; i++) starts[i] = l->wrap_starts[i];
+    return l->wrap_nstarts;
+}
+
 /* Number of visual rows `line_no` occupies in the current view --
  * always 1 in raw Markdown view, which still shows one buffer line
  * per screen row and scrolls horizontally instead (see left_col). */
@@ -786,7 +1092,7 @@ int line_rows(int line_no)
 {
     int starts[MAX_WRAP_ROWS];
     if (view_mode == 1) return 1;
-    return compute_wrap_starts(doc[line_no]->text, starts);
+    return get_line_wraps(line_no, starts);
 }
 
 /* Which wrap segment (0-based) raw column `col` falls into. */
@@ -801,19 +1107,33 @@ int wrap_seg_of_col(int *starts, int nstarts, int col)
  * relative to `lo`, is the closest to target_col without exceeding
  * it. This is what keeps the cursor's screen column stable when
  * Up/Down crosses a wrapped row -- the vertical equivalent of what
- * writer_move_left/right already do for horizontal steps. */
+ * writer_move_left/right already do for horizontal steps.
+ *
+ * Like compute_wrap_starts, this builds the line's screen-column
+ * table once (O(len)) via build_screen_col_table() rather than
+ * calling writer_screen_col() once per candidate column in the
+ * [lo, hi] scan (which used to make this O(len * (hi-lo))). */
 int col_for_target_screen(const char *text, int lo, int hi, int target_col)
 {
-    int base = writer_screen_col(text, lo);
-    int best = lo, c;
+    int base, best = lo, c;
+    build_screen_col_table(text, g_col_table);
+    base = g_col_table[lo];
     for (c = lo; c <= hi; c++) {
-        if (writer_screen_col(text, c) - base > target_col) break;
+        if (g_col_table[c] - base > target_col) break;
         best = c;
     }
     return best;
 }
 
 /* ================= cursor movement ================= */
+/* These just update cur_line/cur_col (and, for Up/Down, the wrap
+ * bookkeeping needed to keep the on-screen column stable) -- they
+ * don't request any redraw themselves. Every call site goes through
+ * do_move() below, which decides the cheapest redraw that's actually
+ * correct: pure cursor movement never changes any line's rendered
+ * content, so as long as the viewport doesn't need to scroll, only
+ * the status bar's position readout and the hardware cursor itself
+ * need touching -- see request_cursor_redraw(). */
 
 void move_left(void)
 {
@@ -851,7 +1171,7 @@ void move_up(void)
         }
         return;
     }
-    n = compute_wrap_starts(doc[cur_line]->text, starts);
+    n = get_line_wraps(cur_line, starts);
     seg = wrap_seg_of_col(starts, n, cur_col);
     target = writer_screen_col(doc[cur_line]->text, cur_col)
            - writer_screen_col(doc[cur_line]->text, starts[seg]);
@@ -861,7 +1181,7 @@ void move_up(void)
     } else if (cur_line > 0) {
         int pstarts[MAX_WRAP_ROWS], pn;
         cur_line--;
-        pn = compute_wrap_starts(doc[cur_line]->text, pstarts);
+        pn = get_line_wraps(cur_line, pstarts);
         cur_col = col_for_target_screen(doc[cur_line]->text, pstarts[pn - 1],
                                           doc[cur_line]->len, target);
     }
@@ -876,7 +1196,7 @@ void move_down(void)
         }
         return;
     }
-    n = compute_wrap_starts(doc[cur_line]->text, starts);
+    n = get_line_wraps(cur_line, starts);
     seg = wrap_seg_of_col(starts, n, cur_col);
     target = writer_screen_col(doc[cur_line]->text, cur_col)
            - writer_screen_col(doc[cur_line]->text, starts[seg]);
@@ -886,7 +1206,7 @@ void move_down(void)
     } else if (cur_line < doc_count - 1) {
         int nstarts[MAX_WRAP_ROWS], nn, hi;
         cur_line++;
-        nn = compute_wrap_starts(doc[cur_line]->text, nstarts);
+        nn = get_line_wraps(cur_line, nstarts);
         hi = (nn > 1) ? nstarts[1] - 1 : doc[cur_line]->len;
         cur_col = col_for_target_screen(doc[cur_line]->text, 0, hi, target);
     }
@@ -923,6 +1243,45 @@ void page_down(void)
     if (cur_col > doc[cur_line]->len) cur_col = doc[cur_line]->len;
 }
 
+/* Requests the cheapest possible redraw: just the status bar (its
+ * line:col/percent readout) and the hardware cursor position, with
+ * every on-screen character left completely alone. Only valid when
+ * NOTHING about document text changed -- see redraw_after_move()
+ * below, the only caller. Never downgrades an already-pending
+ * line/full request. */
+void request_cursor_redraw(void)
+{
+    if (screen_dirty == 0) screen_dirty = 3;
+}
+
+/* Wraps any of the move_ or page_ functions above: calls it, then
+ * figures out the cheapest correct redraw for the result. A true
+ * no-op (arrow key already at the edge of the document) requests
+ * nothing at all. Otherwise: if the viewport had to scroll
+ * (top_line or, in raw view, left_col changed) the whole screen's
+ * contents shifted and needs a full repaint; if it didn't, no line's
+ * rendered text changed at all -- cursor movement never touches
+ * document content -- so only the status bar and cursor need
+ * updating. */
+void do_move(void (*move_fn)(void))
+{
+    int old_line = cur_line, old_col = cur_col;
+    int old_top = top_line, old_left = left_col;
+
+    move_fn();
+    if (cur_line == old_line && cur_col == old_col) return;   /* true no-op */
+
+    scroll_to_cursor();
+    if (top_line != old_top) { request_full_redraw(); return; }
+    if (view_mode == 1) {
+        int new_left = old_left;
+        if (cur_col < new_left) new_left = cur_col;
+        if (cur_col >= new_left + SCREEN_COLS) new_left = cur_col - SCREEN_COLS + 1;
+        if (new_left != old_left) { request_full_redraw(); return; }
+    }
+    request_cursor_redraw();
+}
+
 /* Grows top_line (in whole buffer lines -- a line's visual rows
  * always scroll onto/off screen together) until the cursor's visual
  * row lands within the TEXT_ROWS window. Raw Markdown view is
@@ -938,12 +1297,113 @@ void scroll_to_cursor(void)
     for (;;) {
         int rows = 0, ln, starts[MAX_WRAP_ROWS], n, seg;
         for (ln = top_line; ln < cur_line; ln++) rows += line_rows(ln);
-        n = compute_wrap_starts(doc[cur_line]->text, starts);
+        n = get_line_wraps(cur_line, starts);
         seg = wrap_seg_of_col(starts, n, cur_col);
         rows += seg;
         if (rows < TEXT_ROWS || top_line >= cur_line) break;
         top_line++;
     }
+}
+
+/* ================= confined single-line edit wrappers ================= */
+
+/* After a character-level edit confined to one line (typing,
+ * backspacing, or deleting a single character -- never a line
+ * split/merge, which always request a full redraw themselves),
+ * decides whether the effect really stayed confined to that one
+ * on-screen line, and requests the cheap redraw_line_only() path if
+ * so. Falls back to a full redraw whenever the edit had any side
+ * effect reaching past `line_no`:
+ *   - re-wrapping that line into a different number of visual rows
+ *     shifts every line below it up/down a row in Writer view;
+ *   - scroll_to_cursor() deciding to move top_line means the whole
+ *     viewport's contents shifted;
+ *   - in raw Markdown view, the cursor crossing the horizontal-scroll
+ *     boundary (left_col) means every row's visible slice shifted.
+ * Getting any of these wrong in the "should be full but we picked
+ * line" direction would just be a rendering bug, not a crash, but
+ * the checks above are exactly what redraw_screen() itself already
+ * uses to decide top_line/left_col, so there's no separate logic to
+ * keep in sync. */
+void redraw_after_char_edit(int line_no, int old_nrows, int old_top, int old_left)
+{
+    int new_nrows;
+
+    scroll_to_cursor();
+    if (top_line != old_top) { request_full_redraw(); return; }
+
+    new_nrows = line_rows(line_no);
+    if (new_nrows != old_nrows) { request_full_redraw(); return; }
+
+    if (view_mode == 1) {
+        int new_left = old_left;
+        if (cur_col < new_left) new_left = cur_col;
+        if (cur_col >= new_left + SCREEN_COLS) new_left = cur_col - SCREEN_COLS + 1;
+        if (new_left != old_left) { request_full_redraw(); return; }
+    }
+
+    request_line_redraw(line_no);
+}
+
+/* Call this instead of insert_char() directly from key dispatch (not
+ * from cmd_paste, which wants exactly one redraw for the whole
+ * paste, not one per character -- see insert_char's own comment). A
+ * selection being active forces a full redraw regardless, since
+ * insert_char() clears it and the highlight it's removing can span
+ * more than one line. */
+void do_insert_char(int ch)
+{
+    int line_no = cur_line;
+    int old_nrows, old_top, old_left;
+    if (sel_active) { insert_char(ch); request_full_redraw(); return; }
+    old_nrows = line_rows(line_no);
+    old_top = top_line;
+    old_left = left_col;
+    if (!insert_char(ch)) return;   /* flash_error already requested full */
+    redraw_after_char_edit(line_no, old_nrows, old_top, old_left);
+}
+
+/* Call this instead of backspace() directly from key dispatch. Only
+ * the plain intra-line case (deleting the character just left of the
+ * cursor, cursor not at column 0) is eligible for the cheap path --
+ * backspace() itself still requests a full redraw for the
+ * line-merge case, so this just needs to not interfere with that. */
+void do_backspace(void)
+{
+    int line_no = cur_line;
+    int old_nrows, old_top, old_left;
+    if (sel_active || cur_col == 0) {
+        int had_sel = sel_active;
+        backspace();
+        if (had_sel) request_full_redraw();
+        return;
+    }
+    old_nrows = line_rows(line_no);
+    old_top = top_line;
+    old_left = left_col;
+    backspace();
+    redraw_after_char_edit(line_no, old_nrows, old_top, old_left);
+}
+
+/* Call this instead of delete_forward() directly from key dispatch.
+ * Only the plain intra-line case (deleting the character under the
+ * cursor, cursor not already at end of line) is eligible -- the
+ * merge-with-next-line case still requests a full redraw itself. */
+void do_delete_forward(void)
+{
+    int line_no = cur_line;
+    int old_nrows, old_top, old_left;
+    if (sel_active || cur_col >= doc[cur_line]->len) {
+        int had_sel = sel_active;
+        delete_forward();
+        if (had_sel) request_full_redraw();
+        return;
+    }
+    old_nrows = line_rows(line_no);
+    old_top = top_line;
+    old_left = left_col;
+    delete_forward();
+    redraw_after_char_edit(line_no, old_nrows, old_top, old_left);
 }
 
 /* ================= rendering ================= */
@@ -999,16 +1459,23 @@ unsigned char apply_sel(unsigned char attr, int raw_col, int sel_start, int sel_
  * this row. Callers get these from sel_line_range().
  */
 /* Raw Markdown view: one buffer line per screen row, unwrapped,
- * scrolled horizontally by `offset` (see left_col). */
+ * scrolled horizontally by `offset` (see left_col).
+ *
+ * Writes through row_ptr() directly instead of clear_row()-then-
+ * put_char(): the old version blanked all 80 cells and then
+ * overwrote however many actually have text, so every covered cell
+ * was written twice per redraw for no reason. This writes each cell
+ * exactly once -- content where the line has it, a blank cell where
+ * it doesn't -- with no put_char multiply/bounds-check per glyph
+ * either, since the whole row is already known to be in range. */
 void render_line(const char *text, int row, int offset, int sel_start, int sel_end)
 {
-    int i, len = (int) strlen(text), scr;
-    clear_row(row, ATTR_NORMAL);
-    for (i = 0; i < len; i++) {
-        scr = i - offset;
-        if (scr >= 0 && scr < SCREEN_COLS)
-            put_char(scr, row, text[i], apply_sel(ATTR_NORMAL, i, sel_start, sel_end));
-    }
+    unsigned int far *rp = row_ptr(row);
+    int i, len = (int) strlen(text);
+    int col = 0;
+    for (i = offset; i < len && col < SCREEN_COLS; i++, col++)
+        rp[col] = CELL(text[i], apply_sel(ATTR_NORMAL, i, sel_start, sel_end));
+    for (; col < SCREEN_COLS; col++) rp[col] = CELL(' ', ATTR_NORMAL);
 }
 
 /* Writer view: draws one *visual* row -- the word-wrapped raw-column
@@ -1030,14 +1497,13 @@ void render_line(const char *text, int row, int offset, int sel_start, int sel_e
 void render_writer_line(const char *text, int row, int seg_start, int seg_end,
                          int sel_start, int sel_end)
 {
+    unsigned int far *rp = row_ptr(row);
     int i, col = 0, len = (int) strlen(text);
     int bold = 0, italic = 0, code = 0, strike = 0;
     unsigned char attr;
     int last_col = -1;
     char last_ch = ' ';
     unsigned char last_attr = ATTR_NORMAL;
-
-    clear_row(row, ATTR_NORMAL);
 
     /* horizontal rule: a line that is nothing but 3+ hyphens (always one row) */
     if (len >= 3) {
@@ -1047,7 +1513,7 @@ void render_writer_line(const char *text, int row, int seg_start, int seg_end,
             for (col = 0; col < SCREEN_COLS; col++) {
                 attr = (col < len) ? apply_sel(ATTR_NORMAL, col, sel_start, sel_end)
                                     : ATTR_NORMAL;
-                put_char(col, row, (char) 196, attr);  /* CP437 horizontal line */
+                rp[col] = CELL((char) 196, attr);  /* CP437 horizontal line */
             }
             return;
         }
@@ -1069,7 +1535,8 @@ void render_writer_line(const char *text, int row, int seg_start, int seg_end,
         if (i < len && text[i] == ' ') i++;
         if (seg_start > i) i = seg_start;
         for (; i < len && i < seg_end && col < SCREEN_COLS; i++, col++)
-            put_char(col, row, text[i], apply_sel(hattr, i, sel_start, sel_end));
+            rp[col] = CELL(text[i], apply_sel(hattr, i, sel_start, sel_end));
+        for (; col < SCREEN_COLS; col++) rp[col] = CELL(' ', ATTR_NORMAL);
         return;
     }
 
@@ -1079,7 +1546,8 @@ void render_writer_line(const char *text, int row, int seg_start, int seg_end,
         if (i < len && text[i] == ' ') i++;
         if (seg_start > i) i = seg_start;
         for (; i < len && i < seg_end && col < SCREEN_COLS; i++, col++)
-            put_char(col, row, text[i], apply_sel(ATTR_QUOTE, i, sel_start, sel_end));
+            rp[col] = CELL(text[i], apply_sel(ATTR_QUOTE, i, sel_start, sel_end));
+        for (; col < SCREEN_COLS; col++) rp[col] = CELL(' ', ATTR_NORMAL);
         return;
     }
 
@@ -1090,7 +1558,7 @@ void render_writer_line(const char *text, int row, int seg_start, int seg_end,
              * prefix), so it's checked as a 2-wide range rather than a
              * single raw column like everything else here */
             attr = sel_overlaps(0, 2, sel_start, sel_end) ? swap_attr(ATTR_LISTMARK) : ATTR_LISTMARK;
-            put_char(0, row, (char) 7, attr);  /* CP437 bullet glyph */
+            rp[0] = CELL((char) 7, attr);  /* CP437 bullet glyph */
             col = 1;
             i = 2;
         } else {
@@ -1124,22 +1592,22 @@ void render_writer_line(const char *text, int row, int seg_start, int seg_end,
     while (i < len && i < seg_end) {
         if (text[i] == '*' && i + 1 < len && text[i + 1] == '*') {
             if (last_col >= 0 && sel_overlaps(i, i + 2, sel_start, sel_end))
-                put_char(last_col, row, last_ch, swap_attr(last_attr));
+                rp[last_col] = CELL(last_ch, swap_attr(last_attr));
             bold = !bold; i += 2; continue;
         }
         if (text[i] == '*') {
             if (last_col >= 0 && sel_overlaps(i, i + 1, sel_start, sel_end))
-                put_char(last_col, row, last_ch, swap_attr(last_attr));
+                rp[last_col] = CELL(last_ch, swap_attr(last_attr));
             italic = !italic; i++; continue;
         }
         if (text[i] == '`') {
             if (last_col >= 0 && sel_overlaps(i, i + 1, sel_start, sel_end))
-                put_char(last_col, row, last_ch, swap_attr(last_attr));
+                rp[last_col] = CELL(last_ch, swap_attr(last_attr));
             code = !code; i++; continue;
         }
         if (text[i] == '~' && i + 1 < len && text[i + 1] == '~') {
             if (last_col >= 0 && sel_overlaps(i, i + 2, sel_start, sel_end))
-                put_char(last_col, row, last_ch, swap_attr(last_attr));
+                rp[last_col] = CELL(last_ch, swap_attr(last_attr));
             strike = !strike; i += 2; continue;
         }
         if (text[i] == '[') {
@@ -1151,16 +1619,16 @@ void render_writer_line(const char *text, int row, int seg_start, int seg_end,
                 if (k < len) {
                     int m;
                     if (last_col >= 0 && sel_overlaps(i, i + 1, sel_start, sel_end))
-                        put_char(last_col, row, last_ch, swap_attr(last_attr));  /* leading '[' */
+                        rp[last_col] = CELL(last_ch, swap_attr(last_attr));  /* leading '[' */
                     for (m = i + 1; m < j; m++) {
                         if (col < SCREEN_COLS) {
-                            put_char(col, row, text[m], apply_sel(ATTR_LINK, m, sel_start, sel_end));
+                            rp[col] = CELL(text[m], apply_sel(ATTR_LINK, m, sel_start, sel_end));
                             last_col = col; last_ch = text[m]; last_attr = ATTR_LINK;
                         }
                         col++;
                     }
                     if (last_col >= 0 && sel_overlaps(j, k + 1, sel_start, sel_end))
-                        put_char(last_col, row, last_ch, swap_attr(last_attr));  /* "](url)" */
+                        rp[last_col] = CELL(last_ch, swap_attr(last_attr));  /* "](url)" */
                     i = k + 1;
                     continue;
                 }
@@ -1172,12 +1640,18 @@ void render_writer_line(const char *text, int row, int seg_start, int seg_end,
                  : bold   ? ATTR_BOLD
                  : italic ? ATTR_ITALIC
                  : ATTR_NORMAL;
-            put_char(col, row, text[i], apply_sel(attr, i, sel_start, sel_end));
+            rp[col] = CELL(text[i], apply_sel(attr, i, sel_start, sel_end));
             last_col = col; last_ch = text[i]; last_attr = attr;
         }
         i++;
         col++;
     }
+
+    /* blank out whatever's left of the row past the rendered text --
+     * see render_line's comment for why this replaces the old
+     * clear-then-overwrite (every covered cell written once now, not
+     * twice) */
+    for (; col < SCREEN_COLS; col++) rp[col] = CELL(' ', ATTR_NORMAL);
 }
 
 /* Status bar, laid out like a Neovim statusline:
@@ -1278,6 +1752,83 @@ void draw_menu_popup(void)
     }
 }
 
+/* Draws the shared bottom row (menu bar+popup, or the status bar)
+ * and places the hardware cursor. Shared by redraw_screen() and
+ * redraw_line_only() -- every redraw, full or partial, ends the same
+ * way, since the status bar's contents (modified flag, position,
+ * mode) and the cursor position can change on any edit regardless of
+ * how much of the document view itself needed to move. */
+void draw_bottom_and_cursor(void)
+{
+    if (menu_open >= 0) {
+        draw_menu_bar();
+        draw_menu_popup();
+    } else if (alt_held) {
+        draw_menu_bar();   /* preview only -- no category selected/opened */
+    } else {
+        draw_status_bar();
+    }
+    {
+        int screen_col, screen_row;
+        if (view_mode == 1) {
+            screen_col = cur_col - left_col;
+            screen_row = cur_line - top_line;
+        } else {
+            int starts[MAX_WRAP_ROWS], n, seg, rows, l;
+            n = get_line_wraps(cur_line, starts);
+            seg = wrap_seg_of_col(starts, n, cur_col);
+            rows = 0;
+            for (l = top_line; l < cur_line; l++) rows += line_rows(l);
+            screen_row = rows + seg;
+            screen_col = writer_screen_col(doc[cur_line]->text, cur_col)
+                       - writer_screen_col(doc[cur_line]->text, starts[seg]);
+        }
+        if (screen_col < 0) screen_col = 0;
+        if (screen_col >= SCREEN_COLS) screen_col = SCREEN_COLS - 1;
+        if (screen_row < 0) screen_row = 0;
+        if (screen_row >= TEXT_ROWS) screen_row = TEXT_ROWS - 1;
+        set_cursor(screen_col, screen_row);
+    }
+}
+
+/* Cheap redraw path for an edit request_line_redraw() confirmed is
+ * confined to `line_no`: repaints just that buffer line's on-screen
+ * row(s) (1 in raw view, 1+ wrap segments in Writer view) plus the
+ * status bar and cursor -- the other TEXT_ROWS-1-ish rows on screen
+ * are left completely untouched, since by construction (see
+ * redraw_after_char_edit) nothing about them changed. If `line_no`
+ * isn't currently visible (shouldn't happen -- it's always cur_line,
+ * and scroll_to_cursor keeps cur_line on screen -- but a defensive
+ * fallback costs nothing) this just falls back to a full redraw. */
+void redraw_line_only(int line_no)
+{
+    int sel_start, sel_end, r;
+
+    if (view_mode == 1) {
+        r = line_no - top_line;
+        if (r < 0 || r >= TEXT_ROWS) { redraw_screen(); return; }
+        sel_line_range(line_no, doc[line_no]->len, &sel_start, &sel_end);
+        render_line(doc[line_no]->text, r, left_col, sel_start, sel_end);
+    } else {
+        int starts[MAX_WRAP_ROWS], n, seg, rows_above, l;
+        rows_above = 0;
+        for (l = top_line; l < line_no; l++) rows_above += line_rows(l);
+        if (rows_above >= TEXT_ROWS) { redraw_screen(); return; }
+        n = get_line_wraps(line_no, starts);
+        sel_line_range(line_no, doc[line_no]->len, &sel_start, &sel_end);
+        for (seg = 0; seg < n; seg++) {
+            r = rows_above + seg;
+            if (r >= TEXT_ROWS) break;
+            {
+                int seg_end = (seg + 1 < n) ? starts[seg + 1] : doc[line_no]->len;
+                render_writer_line(doc[line_no]->text, r, starts[seg], seg_end, sel_start, sel_end);
+            }
+        }
+    }
+
+    draw_bottom_and_cursor();
+}
+
 void redraw_screen(void)
 {
     int r, ln;
@@ -1311,7 +1862,7 @@ void redraw_screen(void)
             }
             {
                 int starts[MAX_WRAP_ROWS], n, seg, sel_start, sel_end;
-                n = compute_wrap_starts(doc[ln]->text, starts);
+                n = get_line_wraps(ln, starts);
                 sel_line_range(ln, doc[ln]->len, &sel_start, &sel_end);
                 for (seg = 0; seg < n && r < TEXT_ROWS; seg++, r++) {
                     int seg_end = (seg + 1 < n) ? starts[seg + 1] : doc[ln]->len;
@@ -1322,38 +1873,7 @@ void redraw_screen(void)
         }
     }
 
-    /* Shared bottom row: menu bar (+ its dropdown) while a menu is
-     * open, status line the rest of the time -- see the STATUS_ROW/
-     * CMDBAR_ROW comment up top. */
-    if (menu_open >= 0) {
-        draw_menu_bar();
-        draw_menu_popup();
-    } else if (alt_held) {
-        draw_menu_bar();   /* preview only -- no category selected/opened */
-    } else {
-        draw_status_bar();
-    }
-    {
-        int screen_col, screen_row;
-        if (view_mode == 1) {
-            screen_col = cur_col - left_col;
-            screen_row = cur_line - top_line;
-        } else {
-            int starts[MAX_WRAP_ROWS], n, seg, rows, l;
-            n = compute_wrap_starts(doc[cur_line]->text, starts);
-            seg = wrap_seg_of_col(starts, n, cur_col);
-            rows = 0;
-            for (l = top_line; l < cur_line; l++) rows += line_rows(l);
-            screen_row = rows + seg;
-            screen_col = writer_screen_col(doc[cur_line]->text, cur_col)
-                       - writer_screen_col(doc[cur_line]->text, starts[seg]);
-        }
-        if (screen_col < 0) screen_col = 0;
-        if (screen_col >= SCREEN_COLS) screen_col = SCREEN_COLS - 1;
-        if (screen_row < 0) screen_row = 0;
-        if (screen_row >= TEXT_ROWS) screen_row = TEXT_ROWS - 1;
-        set_cursor(screen_col, screen_row);
-    }
+    draw_bottom_and_cursor();
 }
 
 /* ================= input helpers ================= */
@@ -1472,6 +1992,7 @@ void load_file(const char *fname)
     modified = 0;
     undo_line_no = -1;
     sel_clear();
+    request_full_redraw();
     flash_status("Loaded.");
 }
 
@@ -1569,6 +2090,7 @@ void cmd_new(void)
     if (modified && !confirm("Discard unsaved changes? (Y/N)")) return;
     doc_reset();
     filename[0] = '\0';
+    request_full_redraw();
     flash_status("New file.");
 }
 
@@ -1590,6 +2112,7 @@ int find_from(int start_line, int start_col, const char *needle)
         if (found) {
             cur_line = ln;
             cur_col = (int) (found - doc[ln]->text);
+            request_full_redraw();
             return 1;
         }
     }
@@ -1626,6 +2149,7 @@ void cmd_goto(void)
     if (n >= doc_count) n = doc_count - 1;
     cur_line = n;
     cur_col = 0;
+    request_full_redraw();
 }
 
 void cmd_quit_request(void)
@@ -1638,6 +2162,7 @@ void toggle_vim_mode(void)
     vim_mode = !vim_mode;
     vim_insert = 0;    /* always start in Normal sub-mode when turning it on */
     vim_pending = 0;
+    request_full_redraw();
     flash_status(vim_mode ? "Vim keys ON." : "Vim keys OFF.");
 }
 
@@ -1678,7 +2203,7 @@ void execute_menu_item(int cat, int idx)
             case 2: cmd_goto();      break;
         }
     } else if (cat == 3) {
-        if (idx == 0) view_mode = !view_mode;
+        if (idx == 0) { view_mode = !view_mode; request_full_redraw(); }
         else if (idx == 1) toggle_vim_mode();
     }
 }
@@ -1695,9 +2220,19 @@ int main(int argc, char **argv)
     clear_screen(ATTR_NORMAL);
 
     flash_status("Hold Alt for the menu bar");
+    request_full_redraw();
 
     for (;;) {
-        redraw_screen();
+        if (screen_dirty == 3) {
+            draw_bottom_and_cursor();
+            screen_dirty = 0;
+        } else if (screen_dirty == 2) {
+            redraw_line_only(dirty_line_no);
+            screen_dirty = 0;
+        } else if (screen_dirty) {
+            redraw_screen();
+            screen_dirty = 0;
+        }
 
         /* No key is waiting yet: keep polling, redrawing only when
          * Alt's held/released state actually changes, so the menu
@@ -1730,6 +2265,7 @@ int main(int argc, char **argv)
                     redraw_screen();
                 }
             }
+            _asm { hlt }
         }
         alt_held = 0;
         if (flash_active) {
@@ -1740,6 +2276,7 @@ int main(int argc, char **argv)
              * set its own status_msg afterward, same as normal. */
             flash_active = 0;
             strcpy(status_msg, "Ready.");
+            request_full_redraw();
         }
         if (error_flash_active) {
             /* Unlike a routine flash, the error's attention-color is
@@ -1749,7 +2286,7 @@ int main(int argc, char **argv)
              * instead; the message itself was never going anywhere. */
             long now;
             _bios_timeofday(_TIME_GETCLOCK, &now);
-            if (now >= error_flash_expire) error_flash_active = 0;
+            if (now >= error_flash_expire) { error_flash_active = 0; request_full_redraw(); }
         }
 
         key = _bios_keybrd(_KEYBRD_READ);
@@ -1758,6 +2295,7 @@ int main(int argc, char **argv)
 
         if (menu_open >= 0) {
             /* ---- menu navigation mode ---- */
+            request_full_redraw();   /* menu nav always repaints the popup/bar */
             if (lo == 27) {
                 menu_open = -1;
             } else if (lo == 13) {
@@ -1818,7 +2356,7 @@ int main(int argc, char **argv)
              * Backspace still work underneath exactly like non-vim
              * mode; only the bare unmodified keys change meaning. */
             if (lo == 13) split_line();
-            else if (lo == 8)  backspace();
+            else if (lo == 8)  do_backspace();
             else if (lo == 1)  cmd_save_as();
             else if (lo == 6)  cmd_find();
             else if (lo == 7)  cmd_goto();
@@ -1830,19 +2368,19 @@ int main(int argc, char **argv)
             else if (lo == 22) cmd_paste();
             else if (lo == 26) do_undo();
             else if (vim_pending == 'd' && lo == 'd') { delete_current_line(); vim_pending = 0; }
-            else if (lo == 'h') { move_left();      vim_pending = 0; }
-            else if (lo == 'l') { move_right();     vim_pending = 0; }
-            else if (lo == 'k') { move_up();        vim_pending = 0; }
-            else if (lo == 'j') { move_down();      vim_pending = 0; }
-            else if (lo == '0') { move_home();      vim_pending = 0; }
-            else if (lo == '$') { move_end();       vim_pending = 0; }
-            else if (lo == 'x') { delete_forward(); vim_pending = 0; }
+            else if (lo == 'h') { do_move(move_left);  vim_pending = 0; }
+            else if (lo == 'l') { do_move(move_right); vim_pending = 0; }
+            else if (lo == 'k') { do_move(move_up);    vim_pending = 0; }
+            else if (lo == 'j') { do_move(move_down);  vim_pending = 0; }
+            else if (lo == '0') { do_move(move_home);  vim_pending = 0; }
+            else if (lo == '$') { do_move(move_end);   vim_pending = 0; }
+            else if (lo == 'x') { do_delete_forward(); vim_pending = 0; }
             else if (lo == 'u') { do_undo();        vim_pending = 0; }
-            else if (lo == 'i') { vim_insert = 1;   vim_pending = 0; }
-            else if (lo == 'a') { move_right(); vim_insert = 1; vim_pending = 0; }
+            else if (lo == 'i') { vim_insert = 1;   vim_pending = 0; request_full_redraw(); }
+            else if (lo == 'a') { do_move(move_right); vim_insert = 1; vim_pending = 0; request_full_redraw(); }
             else if (lo == 'd') { vim_pending = 'd'; }
-            else if (lo == ':') { vim_command_line(); vim_pending = 0; }
-            else vim_pending = 0;   /* unrecognized: swallow, don't insert */
+            else if (lo == ':') { vim_command_line(); vim_pending = 0; request_full_redraw(); }
+            else vim_pending = 0;   /* unrecognized: swallow, don't insert -- no screen change */
         }
         else if (lo == 27) {
             /* Esc no longer quits (see Alt+X below) -- it now only
@@ -1851,14 +2389,16 @@ int main(int argc, char **argv)
              * simply a no-op, same as most editors treat a bare Esc. */
             if (sel_active) {
                 sel_clear();
-            } else if (vim_mode) {
+                request_full_redraw();
+            } else if (vim_mode && vim_insert) {
                 vim_insert = 0; vim_pending = 0;  /* Insert -> Normal */
+                request_full_redraw();
             }
         } else if (lo == 0) {
             matched = 0;
             for (k = 0; k < MENU_COUNT; k++) {
                 if (menus[k].altkey_scan == hi) {
-                    menu_open = k; menu_sel = 0; matched = 1; break;
+                    menu_open = k; menu_sel = 0; matched = 1; request_full_redraw(); break;
                 }
             }
             if (!matched) {
@@ -1870,22 +2410,22 @@ int main(int argc, char **argv)
                          * they clear it -- selection tracks
                          * cur_line/cur_col, which the move below
                          * updates as always. */
-                        if (shift_down()) sel_begin();
-                        else sel_clear();
+                        if (shift_down()) { sel_begin(); request_full_redraw(); }
+                        else if (sel_active) { sel_clear(); request_full_redraw(); }
                         switch (hi) {
-                            case 0x4B: move_left();  break;
-                            case 0x4D: move_right(); break;
-                            case 0x48: move_up();    break;
-                            case 0x50: move_down();  break;
-                            case 0x47: move_home();  break;
-                            case 0x4F: move_end();   break;
-                            case 0x49: page_up();    break;
-                            case 0x51: page_down();  break;
+                            case 0x4B: do_move(move_left);  break;
+                            case 0x4D: do_move(move_right); break;
+                            case 0x48: do_move(move_up);    break;
+                            case 0x50: do_move(move_down);  break;
+                            case 0x47: do_move(move_home);  break;
+                            case 0x4F: do_move(move_end);   break;
+                            case 0x49: do_move(page_up);    break;
+                            case 0x51: do_move(page_down);  break;
                         }
                         break;
                     }
-                    case 0x53: delete_forward(); break;
-                    case 0x3C: view_mode = !view_mode; break;  /* F2 */
+                    case 0x53: do_delete_forward(); break;
+                    case 0x3C: view_mode = !view_mode; request_full_redraw(); break;  /* F2 */
                     case 0x3D: cmd_find_next();  break;         /* F3 */
                     case 0x3E: toggle_vim_mode(); break;        /* F4 */
                     case 0x2D: cmd_quit_request(); break;       /* Alt+X */
@@ -1893,7 +2433,7 @@ int main(int argc, char **argv)
                 }
             }
         } else if (lo == 13) split_line();
-        else if (lo == 8)  backspace();
+        else if (lo == 8)  do_backspace();
         else if (lo == 1)  cmd_save_as();
         else if (lo == 6)  cmd_find();
         else if (lo == 7)  cmd_goto();
@@ -1904,7 +2444,7 @@ int main(int argc, char **argv)
         else if (lo == 24) cmd_cut();
         else if (lo == 22) cmd_paste();
         else if (lo == 26) do_undo();
-        else if (lo >= 32 && lo < 127) insert_char(lo);
+        else if (lo >= 32 && lo < 127) do_insert_char(lo);
 
         if (want_quit) break;
     }
@@ -1913,3 +2453,4 @@ int main(int argc, char **argv)
     set_cursor(0, 0);
     return 0;
 }
+
