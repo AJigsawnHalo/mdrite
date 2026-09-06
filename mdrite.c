@@ -209,8 +209,9 @@ MenuCategory menus[MENU_COUNT] = {
     { "Edit",   0x12, { "Undo       ^Z", "Cut        ^X", "Copy       ^C",
                          "Paste      ^V" },
                       { 0, 2, 0, 0 }, 4 },
-    { "Search", 0x1F, { "Find       ^F", "Find Next  F3", "Go To Line ^G" },
-                      { 0, 5, 0 }, 3 },
+    { "Search", 0x1F, { "Find       ^F", "Find Next  F3", "Go To Line ^G",
+                         "Replace    ^R" },
+                      { 0, 5, 0, 0 }, 4 },
     { "View",   0x2F, { "Toggle View F2", "Vim Keys   F4" },
                       { 0, 0 }, 2 },
     { "Help",   0x23, { "About      F1" },
@@ -2145,6 +2146,109 @@ void cmd_find_next(void)
         flash_status("Not found.");
 }
 
+/* Guards Replace All against a replacement that contains the search
+ * string itself (e.g. replacing "a" with "aab"), which would
+ * otherwise keep creating new matches forever. Comfortably above
+ * anything a real document here would ever need. */
+#define REPLACE_LIMIT 5000
+
+/* WordStar-style per-match confirmation, same spirit as Alt+X's
+ * DOS-editor convention elsewhere in this file: (Y)es replaces just
+ * this one, (N)o skips it, (A)ll stops asking and replaces every
+ * remaining match, anything else (including Esc) stops. Blocks for
+ * one keypress, same as confirm(). */
+int prompt_replace_choice(void)
+{
+    int ch;
+    clear_row(CMDBAR_ROW, ATTR_CMDBAR);
+    put_string(0, CMDBAR_ROW, "Replace? (Y)es (N)o (A)ll (Esc) Quit", ATTR_CMDBAR);
+    ch = tolower(_bios_keybrd(_KEYBRD_READ) & 0xFF);
+    if (ch == 'y' || ch == 'n' || ch == 'a') return ch;
+    return 'q';
+}
+
+/* Find and replace. A match never spans lines -- find_from() only
+ * ever searches within one line's text -- so every accepted replace
+ * is exactly a sel_delete() followed by an insert_char() loop: the
+ * same pair cmd_paste() already uses to replace a selection. That
+ * means it inherits the same single-line-undo caveat cmd_paste does
+ * -- Undo only reverts the last character of the last accepted
+ * replace, not the whole operation (see README's Known Limitations).
+ *
+ * Search position bookkeeping mirrors cmd_find(): search strictly
+ * after the cursor first, wrapping to the top of the document if
+ * nothing turns up before it. After an accepted replace, the next
+ * search resumes right where the replacement text ends, so a
+ * replacement that doesn't contain the search string can never be
+ * found again by accident. */
+void cmd_replace(void)
+{
+    char find_buf[80], repl_buf[80], msg[32];
+    int replace_all = 0, had_match = 0, count = 0, guard = 0;
+    int rlen, i, ch = 0;
+    int sline, scol;
+
+    if (!prompt_input("Find: ", find_buf, sizeof(find_buf)) || !find_buf[0]) return;
+    if (!prompt_input("Replace with: ", repl_buf, sizeof(repl_buf))) return;
+    strcpy(last_search, find_buf);
+    rlen = (int) strlen(repl_buf);
+
+    sline = cur_line;
+    scol  = cur_col + 1;   /* same "search strictly after cursor" rule as cmd_find */
+
+    for (;;) {
+        if (!find_from(sline, scol, find_buf) && !find_from(0, 0, find_buf)) break;
+        had_match = 1;
+
+        if (++guard > REPLACE_LIMIT) {
+            flash_error("Replace stopped: too many matches (check replacement text).");
+            break;
+        }
+
+        /* find_from() only marks the screen dirty -- it doesn't
+         * actually repaint, since normally that's left to main()'s
+         * loop. But cmd_replace() never returns to main() between
+         * matches (it loops right here, blocking on
+         * prompt_replace_choice() below), so without an explicit
+         * repaint now the view never scrolls to the match and the
+         * cursor never visibly jumps to it before we ask Y/N/A. */
+        if (!replace_all) {
+            scroll_to_cursor();
+            redraw_screen();
+            screen_dirty = 0;
+            ch = prompt_replace_choice();
+            if (ch == 'q') break;
+            if (ch == 'a') replace_all = 1;
+        }
+
+        if (!replace_all && ch == 'n') {
+            sline = cur_line;
+            scol  = cur_col + 1;    /* skip past this match's start next pass */
+            continue;
+        }
+
+        /* find_from already left cur_line/cur_col at the match's
+         * start -- select exactly the matched span, then reuse the
+         * same delete+insert pair cmd_paste() uses over a selection */
+        anchor_line = cur_line;
+        anchor_col  = cur_col;
+        cur_col += (int) strlen(find_buf);
+        sel_active = 1;
+        sel_delete();
+        for (i = 0; i < rlen; i++) {
+            if (!insert_char((unsigned char) repl_buf[i])) break;
+        }
+        count++;
+        sline = cur_line;
+        scol  = cur_col;    /* resume right after the inserted text */
+    }
+
+    if (count > 0) { sprintf(msg, "Replaced %d.", count); flash_status(msg); }
+    else if (had_match) flash_status("No replacements made.");
+    else flash_status("Not found.");
+    request_full_redraw();
+}
+
 void cmd_goto(void)
 {
     char buf[16];
@@ -2271,6 +2375,7 @@ void execute_menu_item(int cat, int idx)
             case 0: cmd_find();      break;
             case 1: cmd_find_next(); break;
             case 2: cmd_goto();      break;
+            case 3: cmd_replace();   break;
         }
     } else if (cat == 3) {
         if (idx == 0) { view_mode = !view_mode; request_full_redraw(); }
@@ -2432,6 +2537,7 @@ int main(int argc, char **argv)
             else if (lo == 1)  cmd_save_as();
             else if (lo == 6)  cmd_find();
             else if (lo == 7)  cmd_goto();
+            else if (lo == 18) cmd_replace();
             else if (lo == 14) cmd_new();
             else if (lo == 15) cmd_open();
             else if (lo == 19) cmd_save();
@@ -2510,6 +2616,7 @@ int main(int argc, char **argv)
         else if (lo == 1)  cmd_save_as();
         else if (lo == 6)  cmd_find();
         else if (lo == 7)  cmd_goto();
+        else if (lo == 18) cmd_replace();
         else if (lo == 14) cmd_new();
         else if (lo == 15) cmd_open();
         else if (lo == 19) cmd_save();

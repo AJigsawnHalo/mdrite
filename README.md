@@ -28,6 +28,14 @@ mdrite.exe [filename]
 - **Enter / Backspace / Del** -- edit text
 - **Ctrl+S** Save &nbsp; **Ctrl+O** Open &nbsp; **Ctrl+N** New &nbsp; **Ctrl+A** Save As
 - **Ctrl+F** Find &nbsp; **F3** Find Next &nbsp; **Ctrl+G** Go To Line
+  &nbsp; **Ctrl+R** Replace
+  - Replace asks for a search string, then a replacement, then walks
+    matches one at a time: **Y** replaces this one, **N** skips it,
+    **A** stops asking and replaces every remaining match, **Esc**
+    (or anything else) stops. Works the same in vim mode. Like
+    Paste, a replace is a delete+insert pair, so Undo only reverts
+    the last character typed by the last accepted replace, not the
+    whole operation.
 - **Ctrl+Z** Undo (last edit only)
 - **Ctrl+C** Copy &nbsp; **Ctrl+X** Cut &nbsp; **Ctrl+V** Paste
   - Cut/Copy need an active selection ("Nothing selected." in the
@@ -91,8 +99,8 @@ Text-mode limits, on purpose:
 
 Not implemented yet:
 
-- Zoom, true reflowed word-wrap, Replace, and multi-level undo are
-  each their own small project.
+- Zoom, true reflowed word-wrap, and multi-level undo are each their
+  own small project.
 - A selection deleted or replaced across multiple lines isn't
   undoable yet, for the same single-line-undo reason line
   splits/merges aren't.
