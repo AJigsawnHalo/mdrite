@@ -16,8 +16,12 @@
 
 /* ---------- program identity ---------- */
 /* Bump this by hand before cutting a release build. */
-#define MDRITE_VERSION "v0.1"
-#define MDRITE_NAME    "mdrite"
+#define MDRITE_VERSION     "v0.1"
+#define MDRITE_NAME        "mdrite"
+#define MDRITE_DESC        "A small DOS/FreeDOS markdown writer."
+#define MDRITE_COPYRIGHT   "Copyright (c) 2026 Joash Liwanag"
+#define MDRITE_LICENSE     "Licensed under BSD 3-Clause"
+#define MDRITE_REPO_URL    "https://github.com/AJigsawnHalo/mdrite"
 
 /* ---------- screen / buffer constants ---------- */
 #define SCREEN_COLS   80
@@ -182,7 +186,7 @@ int  undo_line_no = -1;
 int  undo_col = 0;
 
 /* ---------- Alt-driven pull-down menu ---------- */
-#define MENU_COUNT      4
+#define MENU_COUNT      5
 #define MAX_MENU_ITEMS  5
 
 typedef struct {
@@ -208,7 +212,9 @@ MenuCategory menus[MENU_COUNT] = {
     { "Search", 0x1F, { "Find       ^F", "Find Next  F3", "Go To Line ^G" },
                       { 0, 5, 0 }, 3 },
     { "View",   0x2F, { "Toggle View F2", "Vim Keys   F4" },
-                      { 0, 0 }, 2 }
+                      { 0, 0 }, 2 },
+    { "Help",   0x23, { "About      F1" },
+                      { 0 }, 1 }
 };
 
 int menu_open = -1;
@@ -2179,6 +2185,70 @@ void vim_command_line(void)
     else flash_error("Unknown command.");
 }
 
+/* About screen: a standalone centered box (double-line CP437 border,
+ * same ATTR_POPUP color as the dropdown menus) rather than another
+ * dropdown item, since it's a whole screen the user reads and
+ * dismisses, not a list they pick from. Blocks on a single keypress
+ * -- any key closes it, same "any key" convention as confirm()'s
+ * Y/N prompt except it doesn't care which key -- then asks for a
+ * full redraw since the box was painted straight over the document
+ * area. */
+void cmd_about(void)
+{
+    const char *lines[] = {
+        "",
+        MDRITE_NAME " " MDRITE_VERSION,
+        "",
+        MDRITE_DESC,
+        "",
+        MDRITE_COPYRIGHT,
+        MDRITE_LICENSE,
+        MDRITE_REPO_URL,
+        "",
+        "Press any key to close",
+        ""
+    };
+    int n = (int) (sizeof(lines) / sizeof(lines[0]));
+    int i, w = 0, len, col;
+    int box_w, box_h, box_col, box_row;
+
+    for (i = 0; i < n; i++) {
+        len = (int) strlen(lines[i]);
+        if (len > w) w = len;
+    }
+    box_w = w + 4;                      /* 1-col border + 1-col pad each side */
+    if (box_w > SCREEN_COLS) box_w = SCREEN_COLS;
+    box_h = n + 2;                      /* +1 border row top and bottom */
+    box_col = (SCREEN_COLS - box_w) / 2;
+    box_row = (TEXT_ROWS - box_h) / 2;
+    if (box_row < 0) box_row = 0;
+
+    for (i = 0; i < box_h; i++) fill_rect(box_col, box_row + i, box_w, ATTR_POPUP);
+
+    put_char(box_col, box_row, (char) 0xC9, ATTR_POPUP);                        /* top-left */
+    put_char(box_col + box_w - 1, box_row, (char) 0xBB, ATTR_POPUP);            /* top-right */
+    put_char(box_col, box_row + box_h - 1, (char) 0xC8, ATTR_POPUP);            /* bottom-left */
+    put_char(box_col + box_w - 1, box_row + box_h - 1, (char) 0xBC, ATTR_POPUP);/* bottom-right */
+    for (i = 1; i < box_w - 1; i++) {
+        put_char(box_col + i, box_row, (char) 0xCD, ATTR_POPUP);
+        put_char(box_col + i, box_row + box_h - 1, (char) 0xCD, ATTR_POPUP);
+    }
+    for (i = 1; i < box_h - 1; i++) {
+        put_char(box_col, box_row + i, (char) 0xBA, ATTR_POPUP);
+        put_char(box_col + box_w - 1, box_row + i, (char) 0xBA, ATTR_POPUP);
+    }
+
+    for (i = 0; i < n; i++) {
+        len = (int) strlen(lines[i]);
+        col = box_col + (box_w - len) / 2;
+        put_string(col, box_row + 1 + i, lines[i], (i == 1) ? ATTR_POPUP_HOT : ATTR_POPUP);
+    }
+
+    set_cursor(box_col + 1, box_row + box_h - 1);
+    _bios_keybrd(_KEYBRD_READ);         /* any key dismisses -- don't care which */
+    request_full_redraw();
+}
+
 void execute_menu_item(int cat, int idx)
 {
     if (cat == 0) {
@@ -2205,6 +2275,8 @@ void execute_menu_item(int cat, int idx)
     } else if (cat == 3) {
         if (idx == 0) { view_mode = !view_mode; request_full_redraw(); }
         else if (idx == 1) toggle_vim_mode();
+    } else if (cat == 4) {
+        if (idx == 0) cmd_about();
     }
 }
 
@@ -2425,6 +2497,7 @@ int main(int argc, char **argv)
                         break;
                     }
                     case 0x53: do_delete_forward(); break;
+                    case 0x3B: cmd_about(); break;                 /* F1 */
                     case 0x3C: view_mode = !view_mode; request_full_redraw(); break;  /* F2 */
                     case 0x3D: cmd_find_next();  break;         /* F3 */
                     case 0x3E: toggle_vim_mode(); break;        /* F4 */
