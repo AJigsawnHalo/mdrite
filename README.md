@@ -83,6 +83,10 @@ mdrite.exe [filename]
 - `- list item` (hyphen bullets only -- asterisk bullets would
   collide with italic's `*` in a simple single-pass scanner)
 - `---` on its own line -- full-width horizontal rule
+- fenced code blocks (` ``` ` on its own line, optionally followed by
+  a language name) -- rendered in a distinct code color, verbatim,
+  with no inline bold/italic/link/list/heading parsing inside the
+  fence so code isn't mangled by markdown rules meant for prose
 
 ## Known Limitations
 
@@ -106,6 +110,12 @@ Not implemented yet:
   splits/merges aren't.
 - No word motions (`w`/`b`/`e`), vim-style visual-mode selection,
   yank/paste registers, counts (`3dd`), or macros in vim-lite mode.
+- Code blocks have no syntax highlighting (one flat color for the
+  whole fence) and still word-wrap long lines like prose rather than
+  horizontal-scrolling, so very long code lines will reflow. The
+  opening fence must start at column 0 -- an indented ` ``` ` (e.g.
+  inside a list item) isn't recognized, matching CommonMark's rule
+  for fences but not yet supporting indented ones.
 
 ## License
 
