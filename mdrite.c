@@ -67,6 +67,7 @@ unsigned char far *video = (unsigned char far *) 0xB8000000L;
 void scroll_to_cursor(void);
 void redraw_screen(void);
 int list_indent_of(const char *text, int len);
+int list_marker_of(const char *text, int len, int *out_marker_len, int *out_ordered);
 void do_list_indent(int dir);
 
 typedef struct {
@@ -595,24 +596,50 @@ int split_line(void)
 void do_split_line(void)
 {
     Line *l = doc[cur_line];
-    int indent;
+    int indent = -1, marker_len = 0, ordered = 0, marker_num = 0;
+    char punct = '-';
     int had_split_col = cur_col;
 
     ensure_code_state();
-    indent = line_in_code(cur_line) ? -1 : list_indent_of(l->text, l->len);
+    if (!line_in_code(cur_line)) {
+        indent = list_marker_of(l->text, l->len, &marker_len, &ordered);
+        if (indent >= 0) {
+            /* Grab the marker's own character(s) before split_line() truncates
+               l->text out from under us: the punctuation + number for an
+               ordered item, or just the bullet character itself otherwise. */
+            if (ordered) {
+                punct = l->text[indent + marker_len - 2];
+                marker_num = atoi(l->text + indent);
+            } else {
+                punct = l->text[indent];
+            }
+        }
+    }
 
     if (!split_line()) return;   /* "Document full." already flashed */
 
-    if (indent >= 0 && had_split_col >= indent + 2) {
+    if (indent >= 0 && had_split_col >= indent + marker_len) {
         Line *nl = doc[cur_line];   /* split_line() left cur_line on the new line */
-        if (nl->len + indent + 2 <= MAX_LINE_LEN) {
-            memmove(nl->text + indent + 2, nl->text, (size_t) (nl->len + 1));
+        char marker_buf[16];
+        int new_marker_len;
+        if (ordered) {
+            /* Continuing an ordered item renumbers it, same as a real editor. */
+            sprintf(marker_buf, "%d%c ", marker_num + 1, punct);
+        } else {
+            /* Continuing an unordered item repeats whichever bullet character
+               (-, +, or *) the item already used. */
+            marker_buf[0] = punct;
+            marker_buf[1] = ' ';
+            marker_buf[2] = '\0';
+        }
+        new_marker_len = (int) strlen(marker_buf);
+        if (nl->len + indent + new_marker_len <= MAX_LINE_LEN) {
+            memmove(nl->text + indent + new_marker_len, nl->text, (size_t) (nl->len + 1));
             memset(nl->text, ' ', (size_t) indent);
-            nl->text[indent] = '-';
-            nl->text[indent + 1] = ' ';
-            nl->len += indent + 2;
+            memcpy(nl->text + indent, marker_buf, (size_t) new_marker_len);
+            nl->len += indent + new_marker_len;
             line_mark_dirty(nl);
-            cur_col += indent + 2;
+            cur_col += indent + new_marker_len;
         } else {
             flash_error("Line too long to continue list.");
         }
@@ -647,12 +674,46 @@ void delete_current_line(void)
 
 /* Maps a raw buffer column to its Writer-view screen column, mirroring render_line's hiding logic so cursor placement and rendering stay in sync. A [link](url) collapses entirely to one screen column. For one-off column queries only -- use build_screen_col_table() for many columns of the same line. */
 /* Scans a possibly-indented list line's marker (leading spaces, then '- '), returning the indent depth or -1 if it isn't a list line. Shared by writer_screen_col, build_screen_col_table, render_writer_line, and do_list_indent() so they all agree on where content starts. */
+/* Scans a possibly-indented list line's marker -- leading spaces, then either
+   an unordered marker ("- ", "+ ", or "* ", all treated as the same bullet)
+   or an ordered marker (one or more digits, capped at 9 per CommonMark,
+   followed by '.' or ')' and a space). Returns the indent depth (the raw
+   column the marker starts at), or -1 if it isn't a list line. When it
+   returns >= 0, *out_marker_len is set to the marker's own byte width
+   (always 2 for an unordered bullet; digit-count + 2 for an ordered marker)
+   and *out_ordered to 1/0. Either output pointer may be NULL if the caller
+   only needs the depth. Every list-aware call site goes through this so they
+   all agree on where content starts, how wide the marker is, and which kind
+   it is. */
+int list_marker_of(const char *text, int len, int *out_marker_len, int *out_ordered)
+{
+    int i = 0, digits;
+    while (i < len && text[i] == ' ') i++;
+
+    if (i < len - 1 && (text[i] == '-' || text[i] == '+' || text[i] == '*') && text[i + 1] == ' ') {
+        if (out_marker_len) *out_marker_len = 2;
+        if (out_ordered) *out_ordered = 0;
+        return i;
+    }
+
+    digits = 0;
+    while (i + digits < len && isdigit((unsigned char) text[i + digits]) && digits < 9) digits++;
+    if (digits > 0 && i + digits + 1 < len &&
+        (text[i + digits] == '.' || text[i + digits] == ')') &&
+        text[i + digits + 1] == ' ') {
+        if (out_marker_len) *out_marker_len = digits + 2;
+        if (out_ordered) *out_ordered = 1;
+        return i;
+    }
+
+    return -1;
+}
+
+/* Back-compat wrapper for call sites that only need the indent depth, not the
+   marker's width or kind (Tab/Shift+Tab's cap logic, prev_list_indent). */
 int list_indent_of(const char *text, int len)
 {
-    int i = 0;
-    while (i < len && text[i] == ' ') i++;
-    if (i < len - 1 && text[i] == '-' && text[i + 1] == ' ') return i;
-    return -1;
+    return list_marker_of(text, len, NULL, NULL);
 }
 
 int writer_screen_col(const char *text, int raw_col, int in_code)
@@ -683,12 +744,17 @@ int writer_screen_col(const char *text, int raw_col, int in_code)
     }
 
     {
-        int indent = list_indent_of(text, len);
-        if (indent >= 0) {
+        int indent, marker_len, ordered;
+        indent = list_marker_of(text, len, &marker_len, &ordered);
+        /* Ordered markers aren't hidden (see build_screen_col_table's comment),
+           so only an unordered bullet collapses here -- and it now collapses to
+           two columns (glyph + its trailing space), not one, to match how
+           render_writer_line actually draws it. */
+        if (indent >= 0 && !ordered) {
             if (raw_col <= indent) return raw_col;
-            if (raw_col < indent + 2) return indent;
-            col = indent + 1;
-            i = indent + 2;
+            if (raw_col < indent + marker_len) return indent;
+            col = indent + 2;
+            i = indent + marker_len;
         }
     }
 
@@ -755,13 +821,19 @@ int build_screen_col_table(const char *text, int *table, int in_code)
     i = 0; col = 0;
     table[0] = 0;
     {
-        int indent = list_indent_of(text, len);
-        if (indent >= 0) {
+        int indent, marker_len, ordered;
+        indent = list_marker_of(text, len, &marker_len, &ordered);
+        /* An ordered marker's digits are real, visible characters -- unlike a
+           bullet, there's nothing to hide, so leave the identity mapping the
+           loop below already produces for ordinary text in place. An
+           unordered bullet still collapses, but now to two columns (glyph +
+           its trailing space) to match render_writer_line. */
+        if (indent >= 0 && !ordered) {
             int k;
             for (k = 1; k <= indent; k++) table[k] = k;
             table[indent + 1] = indent;
-            col = indent + 1;
-            i = indent + 2;
+            col = indent + 2;
+            i = indent + marker_len;
             if (i <= len) table[i] = col;
         }
     }
@@ -1134,8 +1206,9 @@ void do_backspace(void)
 
     ensure_code_state();
     if (!sel_active && cur_col > 0 && cur_col == l->len && !line_in_code(cur_line)) {
-        int indent = list_indent_of(l->text, l->len);
-        if (indent >= 0 && l->len == indent + 2) {
+        int indent, marker_len;
+        indent = list_marker_of(l->text, l->len, &marker_len, NULL);
+        if (indent >= 0 && l->len == indent + marker_len) {
             if (indent > 0) {
                 do_list_indent(-1);
             } else {
@@ -1388,22 +1461,37 @@ void render_writer_line(const char *text, int row, int seg_start, int seg_end,
 
     i = 0;
     {
-        int indent = list_indent_of(text, len);
+        int indent, marker_len, ordered;
+        indent = list_marker_of(text, len, &marker_len, &ordered);
         if (indent >= 0) {
             if (seg_start == 0) {
-                /* Leading indent spaces render as literal columns, so a sublist actually looks indented; only the '- ' marker itself collapses into the bullet glyph. */
+                /* Leading indent spaces render as literal columns, so a sublist actually looks indented. */
                 int s;
                 for (s = 0; s < indent && col < SCREEN_COLS; s++, col++)
                     rp[col] = CELL(' ', apply_sel(ATTR_NORMAL, s, sel_start, sel_end));
-                if (col < SCREEN_COLS) {
-                    attr = sel_overlaps(indent, indent + 2, sel_start, sel_end)
-                         ? swap_attr(ATTR_LISTMARK) : ATTR_LISTMARK;
-                    rp[col] = CELL((char) 7, attr);  /* CP437 bullet glyph */
-                    col++;
+                if (ordered) {
+                    /* The number is meaningful (there's no auto-renumbering pass
+                       to reconstruct it from), so it's drawn literally rather than
+                       collapsed to a glyph -- just recolored like the bullet is. */
+                    int m;
+                    for (m = indent; m < indent + marker_len && col < SCREEN_COLS; m++, col++)
+                        rp[col] = CELL(text[m], apply_sel(ATTR_LISTMARK, m, sel_start, sel_end));
+                } else {
+                    /* The bullet glyph replaces the marker's dash/plus/asterisk;
+                       its trailing space still needs its own column, or content
+                       ends up jammed right up against the bullet. */
+                    if (col < SCREEN_COLS) {
+                        rp[col] = CELL((char) 7, apply_sel(ATTR_LISTMARK, indent, sel_start, sel_end));
+                        col++;
+                    }
+                    if (col < SCREEN_COLS) {
+                        rp[col] = CELL(' ', apply_sel(ATTR_NORMAL, indent + 1, sel_start, sel_end));
+                        col++;
+                    }
                 }
-                i = indent + 2;
+                i = indent + marker_len;
             } else {
-                i = indent + 2;   /* continuation row: replay starts right after "<indent>- " */
+                i = indent + marker_len;   /* continuation row: replay starts right after the marker */
             }
         }
     }
