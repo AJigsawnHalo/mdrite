@@ -595,8 +595,11 @@ int split_line(void)
 void do_split_line(void)
 {
     Line *l = doc[cur_line];
-    int indent = list_indent_of(l->text, l->len);
+    int indent;
     int had_split_col = cur_col;
+
+    ensure_code_state();
+    indent = line_in_code(cur_line) ? -1 : list_indent_of(l->text, l->len);
 
     if (!split_line()) return;   /* "Document full." already flashed */
 
@@ -1129,7 +1132,8 @@ void do_backspace(void)
     int old_nrows, old_top, old_left;
     Line *l = doc[cur_line];
 
-    if (!sel_active && cur_col > 0 && cur_col == l->len) {
+    ensure_code_state();
+    if (!sel_active && cur_col > 0 && cur_col == l->len && !line_in_code(cur_line)) {
         int indent = list_indent_of(l->text, l->len);
         if (indent >= 0 && l->len == indent + 2) {
             if (indent > 0) {
@@ -1199,9 +1203,14 @@ void do_list_indent(int dir)
 {
     int line_no = cur_line;
     Line *l = doc[line_no];
-    int indent = list_indent_of(l->text, l->len);
+    int indent;
     int new_indent, delta;
     int old_nrows, old_top, old_left;
+
+    ensure_code_state();
+    /* Inside a fence, never read the line's content as a list marker -- always fall
+       through to the plain indent/outdent branch below, same as any other code line. */
+    indent = line_in_code(line_no) ? -1 : list_indent_of(l->text, l->len);
 
     if (indent < 0) {
         /* Not a list line: plain editor indent/outdent instead of the sublist marker-shifting logic below. */
