@@ -2197,7 +2197,8 @@ int prompt_replace_choice(void)
 void cmd_replace(void)
 {
     char find_buf[80], repl_buf[80], msg[32];
-    int replace_all = 0, had_match = 0, count = 0, guard = 0;
+    int replace_all = 0, had_match = 0, count = 0;
+    long guard = 0;
     int rlen, i, ch = 0, truncated = 0;
     int sline, scol;
     int first_line = -1, first_col = -1;
