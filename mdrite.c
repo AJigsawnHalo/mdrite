@@ -1253,8 +1253,8 @@ void page_down(void)
 /* Requests the cheapest possible redraw: just the status bar (its
  * line:col/percent readout) and the hardware cursor position, with
  * every on-screen character left completely alone. Only valid when
- * NOTHING about document text changed -- see redraw_after_move()
- * below, the only caller. Never downgrades an already-pending
+ * NOTHING about document text changed -- see do_move() below, the
+ * only caller. Never downgrades an already-pending
  * line/full request. */
 void request_cursor_redraw(void)
 {
@@ -2148,9 +2148,13 @@ void cmd_find_next(void)
 
 /* Guards Replace All against a replacement that contains the search
  * string itself (e.g. replacing "a" with "aab"), which would
- * otherwise keep creating new matches forever. Comfortably above
- * anything a real document here would ever need. */
-#define REPLACE_LIMIT 5000
+ * otherwise keep creating new matches forever. This is a raw
+ * iteration cap, not a per-document match-count estimate -- a large
+ * document doing a very common one-character replace can
+ * legitimately need far more than a few thousand replacements, so
+ * this is set high enough to never fire on realistic usage and only
+ * catch genuine runaway growth. */
+#define REPLACE_LIMIT 200000
 
 /* WordStar-style per-match confirmation, same spirit as Alt+X's
  * DOS-editor convention elsewhere in this file: (Y)es replaces just
@@ -2180,13 +2184,23 @@ int prompt_replace_choice(void)
  * nothing turns up before it. After an accepted replace, the next
  * search resumes right where the replacement text ends, so a
  * replacement that doesn't contain the search string can never be
- * found again by accident. */
+ * found again by accident.
+ *
+ * Stopping condition: first_line/first_col remember the very first
+ * match this call encountered (accepted, skipped, or not -- doesn't
+ * matter). If a later match ever lands back on that exact spot, the
+ * search has gone all the way around the document without changing
+ * it there, so it stops instead of re-prompting the same skipped
+ * match forever -- which is what happened before this remembered
+ * anything: answering (N)o on a match with no further matches ahead
+ * of it wrapped straight back to matches already declined, forever. */
 void cmd_replace(void)
 {
     char find_buf[80], repl_buf[80], msg[32];
     int replace_all = 0, had_match = 0, count = 0, guard = 0;
-    int rlen, i, ch = 0;
+    int rlen, i, ch = 0, truncated = 0;
     int sline, scol;
+    int first_line = -1, first_col = -1;
 
     if (!prompt_input("Find: ", find_buf, sizeof(find_buf)) || !find_buf[0]) return;
     if (!prompt_input("Replace with: ", repl_buf, sizeof(repl_buf))) return;
@@ -2199,6 +2213,13 @@ void cmd_replace(void)
     for (;;) {
         if (!find_from(sline, scol, find_buf) && !find_from(0, 0, find_buf)) break;
         had_match = 1;
+
+        if (first_line < 0) {
+            first_line = cur_line;
+            first_col  = cur_col;
+        } else if (cur_line == first_line && cur_col == first_col) {
+            break;   /* wrapped all the way back to the first match: done */
+        }
 
         if (++guard > REPLACE_LIMIT) {
             flash_error("Replace stopped: too many matches (check replacement text).");
@@ -2236,16 +2257,26 @@ void cmd_replace(void)
         sel_active = 1;
         sel_delete();
         for (i = 0; i < rlen; i++) {
-            if (!insert_char((unsigned char) repl_buf[i])) break;
+            if (!insert_char((unsigned char) repl_buf[i])) { truncated = 1; break; }
         }
         count++;
+        if (truncated) break;   /* insert_char already set its own "Line full." error */
         sline = cur_line;
         scol  = cur_col;    /* resume right after the inserted text */
     }
 
-    if (count > 0) { sprintf(msg, "Replaced %d.", count); flash_status(msg); }
-    else if (had_match) flash_status("No replacements made.");
-    else flash_status("Not found.");
+    if (truncated) {
+        /* Leave insert_char's own "Line full." message in place --
+         * it's more actionable than a blanket success/count message
+         * would be, and papering over it would hide a real problem. */
+    } else if (count > 0) {
+        sprintf(msg, "Replaced %d.", count);
+        flash_status(msg);
+    } else if (had_match) {
+        flash_status("No replacements made.");
+    } else {
+        flash_status("Not found.");
+    }
     request_full_redraw();
 }
 
