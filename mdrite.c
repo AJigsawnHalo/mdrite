@@ -44,6 +44,16 @@
  * "wrap_starts/wrap_nstarts/wrap_dirty" comment on Line. */
 #define MAX_WRAP_ROWS 16
 
+/* Sublist indent step, in spaces, and how deep a list item can nest.
+ * do_list_indent() (Tab/Shift+Tab, see the list-indent section below)
+ * moves a list line's leading-space count by LIST_INDENT_UNIT at a
+ * time. MAX_LIST_INDENT is a hard ceiling on top of the "can't skip
+ * a level" rule that function otherwise enforces on its own -- it
+ * mainly guards against an absurd indent depth eating into a wrapped
+ * line's usable screen width. */
+#define LIST_INDENT_UNIT   4
+#define MAX_LIST_INDENT    24
+
 /* ---------- color attributes ---------- */
 #define ATTR_NORMAL      0x07   /* light grey / black */
 #define ATTR_BOLD        0x0F   /* bright white / black */
@@ -87,9 +97,15 @@ unsigned char far *video = (unsigned char far *) 0xB8000000L;
 /* Forward declarations: do_move() (defined in the cursor-movement
  * section) needs scroll_to_cursor() before its own definition
  * further down that same section, and redraw_line_only() (rendering
- * section) falls back to redraw_screen() defined right after it. */
+ * section) falls back to redraw_screen() defined right after it.
+ * list_indent_of()/do_list_indent() are defined in the word-wrap and
+ * list-indent sections respectively, but do_split_line() (right
+ * after split_line(), below) and do_backspace() (editing-ops
+ * section) both need to call them well before that. */
 void scroll_to_cursor(void);
 void redraw_screen(void);
+int list_indent_of(const char *text, int len);
+void do_list_indent(int dir);
 
 typedef struct {
     char text[MAX_LINE_LEN + 1];
@@ -737,6 +753,48 @@ int split_line(void)
     return 1;
 }
 
+/* Call this instead of split_line() directly from key dispatch (a
+ * real Enter keypress) -- NOT from cmd_paste, which wants a literal
+ * newline dropped into pasted text with nothing extra injected.
+ *
+ * If the line being split is a list item and the cursor was
+ * positioned at or past its marker (i.e. the Enter happened while
+ * actually writing the item's content, not inside the marker itself)
+ * the new line split_line() leaves the cursor on gets that same
+ * indent + "- " prefixed onto whatever text carried over -- the
+ * usual "Enter continues the list" convention most Markdown/outliner
+ * editors follow. Splitting mid-item this way naturally produces two
+ * list items, first line keeping the head of the text and the new
+ * line getting the tail behind a fresh marker.
+ *
+ * That freshly auto-inserted marker, when nothing else gets typed
+ * after it, is exactly what do_backspace()'s dedent/exit-list
+ * shortcut is built to unwind on the very next keystroke if it's a
+ * Backspace instead of more text -- see its comment. */
+void do_split_line(void)
+{
+    Line *l = doc[cur_line];
+    int indent = list_indent_of(l->text, l->len);
+    int had_split_col = cur_col;
+
+    if (!split_line()) return;   /* "Document full." already flashed */
+
+    if (indent >= 0 && had_split_col >= indent + 2) {
+        Line *nl = doc[cur_line];   /* split_line() left cur_line on the new line */
+        if (nl->len + indent + 2 <= MAX_LINE_LEN) {
+            memmove(nl->text + indent + 2, nl->text, (size_t) (nl->len + 1));
+            memset(nl->text, ' ', (size_t) indent);
+            nl->text[indent] = '-';
+            nl->text[indent + 1] = ' ';
+            nl->len += indent + 2;
+            line_mark_dirty(nl);
+            cur_col += indent + 2;
+        } else {
+            flash_error("Line too long to continue list.");
+        }
+    }
+}
+
 /* Removes the whole current line -- used by vim's "dd". Not exposed
  * outside vim mode since there's no non-vim key bound to it. Like
  * split_line/merge, this is a structural change the single-line undo
@@ -790,6 +848,28 @@ void delete_current_line(void)
  * instead -- calling this in a loop over every column of a line is
  * exactly the O(len^2) pattern that used to make word wrap slow on
  * long lines. */
+/* Scans a possibly-indented list line's marker. A list line is any
+ * run of leading spaces (its indent depth, in raw columns -- a
+ * sublist is just a "- " line indented further than its parent)
+ * followed by a dash and a space. Returns that indent depth, or -1
+ * if `text` isn't a list line at all.
+ *
+ * Shared by writer_screen_col, build_screen_col_table, and
+ * render_writer_line below so all three keep agreeing on exactly
+ * where a (sub)list's content starts on screen -- the indent spaces
+ * themselves stay literal, visible columns (that's what makes a
+ * sublist look indented), and only the "- " marker collapses into
+ * the single bullet glyph, same as a top-level list's did before
+ * sublists existed. Also used by do_list_indent() further down to
+ * read a line's current depth before Tab/Shift+Tab change it. */
+int list_indent_of(const char *text, int len)
+{
+    int i = 0;
+    while (i < len && text[i] == ' ') i++;
+    if (i < len - 1 && text[i] == '-' && text[i + 1] == ' ') return i;
+    return -1;
+}
+
 int writer_screen_col(const char *text, int raw_col)
 {
     int i = 0, col = 0, len = (int) strlen(text);
@@ -816,10 +896,14 @@ int writer_screen_col(const char *text, int raw_col)
         return raw_col - i;
     }
 
-    if (text[0] == '-' && len > 1 && text[1] == ' ') {
-        if (raw_col < 2) return 0;
-        col = 1;
-        i = 2;
+    {
+        int indent = list_indent_of(text, len);
+        if (indent >= 0) {
+            if (raw_col <= indent) return raw_col;
+            if (raw_col < indent + 2) return indent;
+            col = indent + 1;
+            i = indent + 2;
+        }
     }
 
     while (i < raw_col && i < len) {
@@ -899,11 +983,16 @@ int build_screen_col_table(const char *text, int *table)
 
     i = 0; col = 0;
     table[0] = 0;
-    if (text[0] == '-' && len > 1 && text[1] == ' ') {
-        if (len >= 1) table[1] = 0;
-        col = 1;
-        i = 2;
-        if (i <= len) table[i] = col;
+    {
+        int indent = list_indent_of(text, len);
+        if (indent >= 0) {
+            int k;
+            for (k = 1; k <= indent; k++) table[k] = k;
+            table[indent + 1] = indent;
+            col = indent + 1;
+            i = indent + 2;
+            if (i <= len) table[i] = col;
+        }
     }
 
     while (i < len) {
@@ -1374,11 +1463,47 @@ void do_insert_char(int ch)
  * the plain intra-line case (deleting the character just left of the
  * cursor, cursor not at column 0) is eligible for the cheap path --
  * backspace() itself still requests a full redraw for the
- * line-merge case, so this just needs to not interfere with that. */
+ * line-merge case, so this just needs to not interfere with that.
+ *
+ * Ahead of all that: Backspace on a list line that's nothing but its
+ * own marker yet (cursor sitting right at the end of it, no item text
+ * typed after -- exactly what do_split_line() above leaves behind
+ * when Enter auto-continues a list) steps the item back out one
+ * indent level instead of deleting a single character of the marker.
+ * That's what turns "Enter, then Backspace" into "give me a new
+ * top-level item instead of a sublist continuation": each Backspace
+ * presses walk the empty item back up a level via do_list_indent(-1)
+ * until it's already at the left margin, at which point there's no
+ * shallower level left to step back to, so the marker itself is
+ * cleared, leaving a plain blank line (i.e. Backspace out of the
+ * list entirely). Same convention most outliner/Markdown editors use. */
 void do_backspace(void)
 {
     int line_no = cur_line;
     int old_nrows, old_top, old_left;
+    Line *l = doc[cur_line];
+
+    if (!sel_active && cur_col > 0 && cur_col == l->len) {
+        int indent = list_indent_of(l->text, l->len);
+        if (indent >= 0 && l->len == indent + 2) {
+            if (indent > 0) {
+                do_list_indent(-1);
+            } else {
+                old_nrows = line_rows(line_no);
+                old_top = top_line;
+                old_left = left_col;
+                save_undo(line_no);
+                l->text[0] = '\0';
+                l->len = 0;
+                line_mark_dirty(l);
+                cur_col = 0;
+                modified = 1;
+                redraw_after_char_edit(line_no, old_nrows, old_top, old_left);
+            }
+            return;
+        }
+    }
+
     if (sel_active || cur_col == 0) {
         int had_sel = sel_active;
         backspace();
@@ -1410,6 +1535,134 @@ void do_delete_forward(void)
     old_top = top_line;
     old_left = left_col;
     delete_forward();
+    redraw_after_char_edit(line_no, old_nrows, old_top, old_left);
+}
+
+/* ================= list indent (Tab / Shift+Tab) ================= */
+
+/* Indent depth of the nearest list item at or above `line_no`,
+ * skipping over blank spacer lines in between (a blank line between
+ * two list items shouldn't break "nest under the item above" just
+ * because it isn't itself a list line). Stops and reports "no
+ * eligible parent" (-1) the moment it hits a non-blank line that
+ * isn't a list item, same as running off the top of the document --
+ * either way there's nothing to nest under. Only looked at by
+ * do_list_indent() below, and only when indenting (dir > 0): Shift+Tab
+ * never needs to know about neighboring lines. */
+int prev_list_indent(int line_no)
+{
+    int i;
+    for (i = line_no - 1; i >= 0; i--) {
+        if (doc[i]->len == 0) continue;
+        return list_indent_of(doc[i]->text, doc[i]->len);
+    }
+    return -1;
+}
+
+/* Tab (dir > 0) / Shift+Tab (dir < 0). On a list line this shifts the
+ * marker LIST_INDENT_UNIT spaces right or left -- one level deeper
+ * into (or back out of) a sublist -- with the guards described below.
+ * On any other line it falls back to how Tab/Shift+Tab work in an
+ * ordinary text editor: Tab inserts LIST_INDENT_UNIT spaces at the
+ * cursor (same as typing them one at a time -- see insert_char's own
+ * per-line single-level undo caveat, which this inherits the same
+ * way cmd_paste's multi-char inserts do), and Shift+Tab strips up to
+ * LIST_INDENT_UNIT spaces of leading whitespace from the line,
+ * regardless of where the cursor sits on it.
+ *
+ * Sublist indenting is capped to one level past the nearest eligible
+ * list item above (see prev_list_indent()), the same "can't skip a
+ * level" rule most outline/Markdown editors enforce -- otherwise a
+ * stray Tab could produce a sublist with no parent bullet to hang off
+ * of. MAX_LIST_INDENT is a hard ceiling on top of that. Sublist
+ * outdenting only ever needs to stay >= 0; it doesn't look at
+ * neighboring lines at all, so it can't fail for any reason other
+ * than already being at the left margin.
+ *
+ * Only ever touches the current line -- a multi-line selection isn't
+ * expanded across, matching this feature's scope; re-indenting a
+ * block of items (or a block of plain text) can always be done one
+ * Tab/Shift+Tab per line. */
+void do_list_indent(int dir)
+{
+    int line_no = cur_line;
+    Line *l = doc[line_no];
+    int indent = list_indent_of(l->text, l->len);
+    int new_indent, delta;
+    int old_nrows, old_top, old_left;
+
+    if (indent < 0) {
+        /* Not a list line: plain editor indent/outdent instead of the
+         * sublist marker-shifting logic below. */
+        if (dir > 0) {
+            int n;
+            if (l->len + LIST_INDENT_UNIT > MAX_LINE_LEN) {
+                flash_error("Line too long to indent.");
+                return;
+            }
+            for (n = 0; n < LIST_INDENT_UNIT; n++) insert_char(' ');
+            request_full_redraw();
+        } else {
+            int lead = 0;
+            while (lead < l->len && l->text[lead] == ' ') lead++;
+            if (lead == 0) return;   /* no leading whitespace to strip */
+            delta = (lead < LIST_INDENT_UNIT) ? lead : LIST_INDENT_UNIT;
+            save_undo(line_no);
+            memmove(l->text, l->text + delta, (size_t) (l->len - delta + 1));
+            l->len -= delta;
+            line_mark_dirty(l);
+            cur_col -= delta;
+            if (cur_col < 0) cur_col = 0;
+            modified = 1;
+            request_full_redraw();
+        }
+        return;
+    }
+
+    if (dir > 0) {
+        int p_indent = prev_list_indent(line_no);
+        int cap = (p_indent >= 0) ? p_indent + LIST_INDENT_UNIT : indent;
+        new_indent = indent + LIST_INDENT_UNIT;
+        if (new_indent > MAX_LIST_INDENT) {
+            flash_error("Can't indent further: max list depth reached.");
+            return;
+        }
+        if (new_indent > cap) {
+            flash_error("Can't indent further: no parent item at that level.");
+            return;
+        }
+    } else {
+        new_indent = indent - LIST_INDENT_UNIT;
+        if (new_indent < 0) return;   /* already at the left margin */
+    }
+
+    if (l->len + LIST_INDENT_UNIT > MAX_LINE_LEN) {
+        flash_error("Line too long to indent.");
+        return;
+    }
+
+    old_nrows = line_rows(line_no);
+    old_top = top_line;
+    old_left = left_col;
+
+    delta = new_indent - indent;
+    save_undo(line_no);
+    if (delta > 0) {
+        /* open a `delta`-wide gap at the start of the line, then fill
+         * it with spaces -- same memmove-block-copy idiom insert_char
+         * uses to shift text right, see its comment for why */
+        memmove(l->text + delta, l->text, (size_t) (l->len + 1));
+        memset(l->text, ' ', (size_t) delta);
+    } else {
+        /* remove -delta leading spaces */
+        memmove(l->text, l->text - delta, (size_t) (l->len + 1 + delta));
+    }
+    l->len += delta;
+    line_mark_dirty(l);
+    cur_col += delta;
+    if (cur_col < 0) cur_col = 0;
+    modified = 1;
+
     redraw_after_char_edit(line_no, old_nrows, old_top, old_left);
 }
 
@@ -1559,17 +1812,29 @@ void render_writer_line(const char *text, int row, int seg_start, int seg_end,
     }
 
     i = 0;
-    if (text[0] == '-' && len > 1 && text[1] == ' ') {
-        if (seg_start == 0) {
-            /* the bullet glyph stands in for raw columns 0-1 (the "- "
-             * prefix), so it's checked as a 2-wide range rather than a
-             * single raw column like everything else here */
-            attr = sel_overlaps(0, 2, sel_start, sel_end) ? swap_attr(ATTR_LISTMARK) : ATTR_LISTMARK;
-            rp[0] = CELL((char) 7, attr);  /* CP437 bullet glyph */
-            col = 1;
-            i = 2;
-        } else {
-            i = 2;   /* continuation row: replay starts right after "- " */
+    {
+        int indent = list_indent_of(text, len);
+        if (indent >= 0) {
+            if (seg_start == 0) {
+                /* leading indent spaces render as plain, literal
+                 * columns -- that's what makes a sublist actually look
+                 * indented -- and only then does the bullet glyph stand
+                 * in for the "- " marker (checked as a 2-wide range
+                 * rather than a single raw column like everything else
+                 * here, same as the un-indented case always did) */
+                int s;
+                for (s = 0; s < indent && col < SCREEN_COLS; s++, col++)
+                    rp[col] = CELL(' ', apply_sel(ATTR_NORMAL, s, sel_start, sel_end));
+                if (col < SCREEN_COLS) {
+                    attr = sel_overlaps(indent, indent + 2, sel_start, sel_end)
+                         ? swap_attr(ATTR_LISTMARK) : ATTR_LISTMARK;
+                    rp[col] = CELL((char) 7, attr);  /* CP437 bullet glyph */
+                    col++;
+                }
+                i = indent + 2;
+            } else {
+                i = indent + 2;   /* continuation row: replay starts right after "<indent>- " */
+            }
         }
     }
 
@@ -2564,7 +2829,7 @@ int main(int argc, char **argv)
              * commands here, not text -- Ctrl-shortcuts, Enter, and
              * Backspace still work underneath exactly like non-vim
              * mode; only the bare unmodified keys change meaning. */
-            if (lo == 13) split_line();
+            if (lo == 13) do_split_line();
             else if (lo == 8)  do_backspace();
             else if (lo == 1)  cmd_save_as();
             else if (lo == 6)  cmd_find();
@@ -2577,6 +2842,7 @@ int main(int argc, char **argv)
             else if (lo == 24) cmd_cut();
             else if (lo == 22) cmd_paste();
             else if (lo == 26) do_undo();
+            else if (lo == 9)  { do_list_indent(1); vim_pending = 0; }
             else if (vim_pending == 'd' && lo == 'd') { delete_current_line(); vim_pending = 0; }
             else if (lo == 'h') { do_move(move_left);  vim_pending = 0; }
             else if (lo == 'l') { do_move(move_right); vim_pending = 0; }
@@ -2635,6 +2901,7 @@ int main(int argc, char **argv)
                         break;
                     }
                     case 0x53: do_delete_forward(); break;
+                    case 0x0F: do_list_indent(-1); break;       /* Shift+Tab */
                     case 0x3B: cmd_about(); break;                 /* F1 */
                     case 0x3C: view_mode = !view_mode; request_full_redraw(); break;  /* F2 */
                     case 0x3D: cmd_find_next();  break;         /* F3 */
@@ -2643,7 +2910,7 @@ int main(int argc, char **argv)
                     default: break;
                 }
             }
-        } else if (lo == 13) split_line();
+        } else if (lo == 13) do_split_line();
         else if (lo == 8)  do_backspace();
         else if (lo == 1)  cmd_save_as();
         else if (lo == 6)  cmd_find();
@@ -2656,6 +2923,7 @@ int main(int argc, char **argv)
         else if (lo == 24) cmd_cut();
         else if (lo == 22) cmd_paste();
         else if (lo == 26) do_undo();
+        else if (lo == 9)  do_list_indent(1);
         else if (lo >= 32 && lo < 127) do_insert_char(lo);
 
         if (want_quit) break;
