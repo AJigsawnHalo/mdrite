@@ -55,18 +55,45 @@ mdrite.exe [filename]
   does -- the menu is a second way in, not a separate code path.
 - **Vim-lite mode** (F4 to toggle, off by default). Starts in Normal
   sub-mode:
-  - `h`/`j`/`k`/`l` move, `0`/`$` start/end of line, `i` insert
-    (before cursor), `a` insert (after cursor), `x` delete char,
-    `dd` delete line, `u` undo, `:` opens a command line
-    (`:w` `:q` `:wq` `:q!`).
-  - Esc in Insert sub-mode returns to Normal.
+  - Motions: `h` `j` `k` `l`, `w`/`b`/`e` and `W`/`B`/`E` word
+    motions, `ge`/`gE` back to word end, `0`/`^`/`$` line start
+    (first non-blank / column 0) and end, `gg`/`G` top/bottom (both
+    take a count line number), `H`/`M`/`L` top/middle/bottom of
+    screen, `{`/`}` paragraph back/forward, `%` matching bracket,
+    `f`/`F`/`t`/`T` find/till char and `;`/`,` repeat, `g_` last
+    non-blank. Any motion (and `dd`/`yy`) takes a count prefix, e.g.
+    `3dd`, `5j`, `2w`.
+  - Editing: `i`/`a`/`I`/`A` insert variants, `o`/`O` open line
+    below/above, `x` delete char, `r` replace one char, `R` Replace
+    sub-mode (overwrite instead of insert), `s`/`S` substitute
+    char/line, `C`/`D` change/delete to end of line, `J`/`gJ` join
+    lines (with/without a space), `u`/`U` undo (single-level, so
+    both just undo the last edit), Ctrl+r redo (also single-level).
+  - Operators: `d`/`y`/`c` combine with a motion or text object --
+    `dd`/`yy`/`cc`, `dw`/`yw`, `d$`, `cw`/`ce` (real vim's cw-acts-
+    like-ce quirk included), and `diw`/`daw`/`yiw`/`yaw`/`ciw` word
+    objects. `p`/`P` paste after/before (linewise if the last
+    yank/delete was a whole line).
+  - Visual mode: `v` charwise, `V` linewise, Esc cancels. Inside
+    Visual: `d`/`x` delete, `y` yank, `~`/`u`/`U` case toggle/lower/
+    upper, `o` swap selection ends, and `iw`/`aw`/`ib`/`ab`/`iB`/`aB`
+    text objects (word, `(...)`, `{...}`). Shift+arrows selection
+    still works too, just not through `v`/`V`.
+  - Scrolling: Ctrl+d/u half-page, Ctrl+e/y one line, `zz`/`zt`/`zb`
+    center/top/bottom the viewport without moving the cursor.
+  - `:` opens a command line (`:w` `:q` `:wq` `:q!`).
+  - Esc in Insert/Replace sub-mode returns to Normal, or cancels
+    Visual mode.
   - Ctrl-shortcuts (including Copy/Cut/Paste), Enter, and Backspace
-    keep working the same in both sub-modes. This is a small,
-    honestly-scoped subset -- no word motions (`w`/`b`/`e`), no
-    vim-style visual-mode selection (Shift+arrows works in vim mode
-    too, just not `v`/`V`), no yank/paste registers, no counts
-    (`3dd`), no macros. See [Known Limitations](#known-limitations)
-    below for what's still missing, vim-specific and otherwise.
+    keep working the same across sub-modes -- Ctrl+r is the one
+    exception, rebound to redo in Normal/Visual sub-mode only,
+    since that's vim's real redo key; it's still Replace everywhere
+    else (Insert sub-mode, or vim mode off).
+  - Still missing: multi-level undo/redo (one step only, matching
+    the editor's regular Undo), yank/paste registers beyond the one
+    clipboard slot, and macros. See [Known
+    Limitations](#known-limitations) below for what's still
+    missing, vim-specific and otherwise.
 - **Esc**, outside of vim mode and menus: clears an active selection
   if there is one; otherwise it's a no-op now that quitting has its
   own key (Alt+X).
@@ -108,8 +135,9 @@ Not implemented yet:
 - A selection deleted or replaced across multiple lines isn't
   undoable yet, for the same single-line-undo reason line
   splits/merges aren't.
-- No word motions (`w`/`b`/`e`), vim-style visual-mode selection,
-  yank/paste registers, counts (`3dd`), or macros in vim-lite mode.
+- Vim-lite: single clipboard slot (no numbered/named registers),
+  single-level undo/redo, no macros, no `gj`/`gk` (wrap-row-aware
+  movement).
 - Code blocks have no syntax highlighting (one flat color for the
   whole fence) and still word-wrap long lines like prose rather than
   horizontal-scrolling, so very long code lines will reflow. The
