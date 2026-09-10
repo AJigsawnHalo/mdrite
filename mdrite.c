@@ -60,6 +60,7 @@
 #define ATTR_POPUP_HOT   0x1E   /* dropdown item's mnemonic letter, same trick as ATTR_CMDBAR_HOT */
 #define ATTR_MODE_NORMAL 0x2F   /* bright white / green -- vim Normal indicator */
 #define ATTR_MODE_INSERT 0x6F   /* bright white / brown(orange) -- vim Insert indicator */
+#define ATTR_MODE_VISUAL 0x5F   /* bright white / magenta -- vim Visual/Visual Line indicator */
 
 unsigned char far *video = (unsigned char far *) 0xB8000000L;
 
@@ -89,6 +90,12 @@ int code_state_valid = 0;
 int  cur_line = 0, cur_col = 0;
 int  top_line = 0;
 int  left_col = 0;
+/* Horizontal scroll offset for code-fence lines in Writer view, independent
+   of left_col (which only applies to Raw Markdown view). Recomputed the same
+   way left_col is -- clamped to keep cur_col on screen -- but only while
+   cur_line is inside a fence; leaving code resets it to 0 so an untouched
+   code block off-screen from the cursor still renders from column 0. */
+int  code_left_col = 0;
 int  modified = 0;
 char filename[80] = "";
 int  view_mode = 0;     /* 0 = Rich (rendered), 1 = raw Markdown. Kept as an int, not a bool, since a Graphics mode may be added later. */
@@ -118,11 +125,33 @@ void request_line_redraw(int line_no)
 int vim_mode = 0;
 int vim_insert = 0;    /* 0 = Normal sub-mode, 1 = Insert sub-mode */
 int vim_pending = 0;   /* holds the first key of a two-key command, e.g. 'd' of dd */
+int vim_visual = 0;    /* 0 = not in Visual, 1 = charwise (v), 2 = linewise (V) */
+int vim_count = 0;     /* pending repeat count typed before a motion/operator, e.g. the 3 of 3dd; 0 means "none given", so commands default to 1 */
+/* 1 when the clipboard holds a whole-line yank/delete (from yy/dd/Visual
+   Line), so p/P insert it as new line(s) below/above the cursor instead of
+   the normal inline charwise paste. */
+int vim_yank_linewise = 0;
+/* Last f/F/t/T target, for ;/, to repeat. vim_last_find_cmd is 0 (none yet) or one of 'f'/'F'/'t'/'T'. */
+int vim_last_find_cmd = 0;
+int vim_last_find_char = 0;
+/* Second-stage pending key, for 3-key Normal-mode sequences (diw, daw, yiw, yaw, ciw): vim_pending holds the operator ('d'/'y'/'c'), vim_pending2 holds the 'i'/'a' that follows it. Also unused (stays 0) for the 2-key Visual-mode object commands (viw etc.), which only need vim_pending. */
+int vim_pending2 = 0;
+/* R (Replace): like Insert (vim_insert stays 1 so Esc/redraw share that path), but typed characters overwrite the character under the cursor instead of pushing it right. Backspace just steps the cursor back without restoring the overwritten character -- a deliberate simplification, since doing that properly needs its own per-position undo log. */
+int vim_replace = 0;
 
 /* Single-level undo: remembers only one line's previous contents. */
 Line undo_line;
 int  undo_line_no = -1;
 int  undo_col = 0;
+
+/* Single-level redo, symmetric with undo above: do_undo() stashes what it's
+   about to overwrite here before restoring undo_line, and do_redo() does the
+   same back into undo_line -- so u/Ctrl+r can ping-pong once, but (same
+   honestly-scoped limit as undo) not chain further, and any new edit clears
+   this via save_undo(). */
+Line redo_line;
+int  redo_line_no = -1;
+int  redo_col = 0;
 
 /* ---------- Alt-driven pull-down menu ---------- */
 #define MENU_COUNT      5
@@ -178,8 +207,13 @@ int  clip_len = 0;
 /* A selection is an anchor plus the live cursor position, both in raw buffer coordinates -- so it renders correctly in either view with no translation needed. */
 int sel_active   = 0;
 int anchor_line  = 0, anchor_col = 0;
+/* Set for vim's Visual Line mode (V): sel_line_range() then highlights each
+   touched line in full regardless of anchor_col/cur_col, instead of the
+   normal per-column charwise range. Plain Shift-move selection never sets
+   this, so it always defaults back to charwise. */
+int sel_linewise = 0;
 
-void sel_clear(void) { sel_active = 0; }
+void sel_clear(void) { sel_active = 0; sel_linewise = 0; }
 
 /* Starts a selection at the cursor if one isn't already active; safe to call on every Shift-move since later calls in a run are no-ops. */
 void sel_begin(void)
@@ -213,8 +247,14 @@ void sel_line_range(int line_no, int line_len, int *out_start, int *out_end)
     if (!sel_active) return;
 
     sel_bounds(&sl, &sc, &el, &ec);
-    if (sl == el && sc == ec) return;           /* empty selection */
-    if (line_no < sl || line_no > el) return;    /* line not touched */
+    if (!sel_linewise && sl == el && sc == ec) return;   /* empty selection */
+    if (line_no < sl || line_no > el) return;             /* line not touched */
+
+    if (sel_linewise) {
+        *out_start = 0;
+        *out_end   = line_len;
+        return;
+    }
 
     *out_start = (line_no == sl) ? sc : 0;
     *out_end   = (line_no == el) ? ec : line_len;
@@ -355,17 +395,22 @@ void doc_reset(void)
     for (i = 0; i < doc_count; i++) free(doc[i]);
     doc[0] = new_line();
     doc_count = 1;
-    cur_line = cur_col = top_line = left_col = 0;
+    cur_line = cur_col = top_line = left_col = code_left_col = 0;
     modified = 0;
     undo_line_no = -1;
     sel_clear();
     code_state_valid = 0;
 }
 
-/* A line opens/closes a fence if it starts with ``` -- no leading spaces allowed, same as CommonMark. */
+/* A line opens/closes a fence if it starts with ``` after 0-3 leading spaces
+   -- CommonMark allows up to 3 spaces of fence indentation before it counts
+   as an indented code block instead (which this simple scanner doesn't
+   support), so 4+ leading spaces correctly falls through to "not a fence". */
 int is_fence_line(Line *l)
 {
-    return l->len >= 3 && l->text[0] == '`' && l->text[1] == '`' && l->text[2] == '`';
+    int i = 0;
+    while (i < l->len && i < 3 && l->text[i] == ' ') i++;
+    return l->len >= i + 3 && l->text[i] == '`' && l->text[i + 1] == '`' && l->text[i + 2] == '`';
 }
 
 /* One O(doc_count) pass, only run when code_state_valid is 0. Also drops every line's wrap cache, since wrap columns are computed differently in and out of a fence and this is the one place that knows fence membership might have shifted. */
@@ -400,6 +445,7 @@ void save_undo(int line_no)
     undo_line.len = doc[line_no]->len;
     undo_line_no = line_no;
     undo_col = cur_col;
+    redo_line_no = -1;   /* a fresh edit clears any pending redo, same as real vim */
 }
 
 void do_undo(void)
@@ -409,6 +455,12 @@ void do_undo(void)
         return;
     }
     sel_clear();
+    /* stash what we're about to overwrite so Ctrl+r can restore it */
+    strcpy(redo_line.text, doc[undo_line_no]->text);
+    redo_line.len = doc[undo_line_no]->len;
+    redo_line_no = undo_line_no;
+    redo_col = cur_col;
+
     strcpy(doc[undo_line_no]->text, undo_line.text);
     doc[undo_line_no]->len = undo_line.len;
     line_mark_dirty(doc[undo_line_no]);
@@ -417,6 +469,30 @@ void do_undo(void)
     cur_col = undo_col;
     undo_line_no = -1;
     flash_status("Undid last edit.");
+    modified = 1;
+}
+
+/* Ctrl+r: reverses the last do_undo(), symmetrically stashing the pre-redo state back into undo_line so u/Ctrl+r can be pressed back and forth once. */
+void do_redo(void)
+{
+    if (redo_line_no < 0 || redo_line_no >= doc_count) {
+        flash_status_for("Nothing to redo.", FLASH_SECS(2));
+        return;
+    }
+    sel_clear();
+    strcpy(undo_line.text, doc[redo_line_no]->text);
+    undo_line.len = doc[redo_line_no]->len;
+    undo_line_no = redo_line_no;
+    undo_col = cur_col;
+
+    strcpy(doc[redo_line_no]->text, redo_line.text);
+    doc[redo_line_no]->len = redo_line.len;
+    line_mark_dirty(doc[redo_line_no]);
+    code_state_valid = 0;
+    cur_line = redo_line_no;
+    cur_col = redo_col;
+    redo_line_no = -1;
+    flash_status("Redid last edit.");
     modified = 1;
 }
 
@@ -918,7 +994,12 @@ int compute_wrap_starts(const char *text, int *starts, int in_code)
 
     starts[0] = 0;
 
-    if (!in_code && len >= 3) {
+    /* Code lines never word-wrap -- they horizontal-scroll instead, the same
+       way Raw Markdown view scrolls the whole document, via code_left_col.
+       Always exactly one visual row. */
+    if (in_code) return 1;
+
+    if (len >= 3) {
         int all_dash = 1, ii;
         for (ii = 0; ii < len; ii++) if (text[ii] != '-') { all_dash = 0; break; }
         if (all_dash) return 1;   /* horizontal rule: always one row */
@@ -1124,6 +1205,7 @@ void do_move(void (*move_fn)(void))
 {
     int old_line = cur_line, old_col = cur_col;
     int old_top = top_line, old_left = left_col;
+    int old_code_left = code_left_col;
 
     move_fn();
     if (cur_line == old_line && cur_col == old_col) return;   /* true no-op */
@@ -1135,8 +1217,26 @@ void do_move(void (*move_fn)(void))
         if (cur_col < new_left) new_left = cur_col;
         if (cur_col >= new_left + SCREEN_COLS) new_left = cur_col - SCREEN_COLS + 1;
         if (new_left != old_left) { request_full_redraw(); return; }
+    } else {
+        /* Same shift-check as above, for a code line's horizontal scroll
+           instead of Raw view's -- covers moving within a scrolled code
+           line, into one, or back out of one (which must snap to 0). */
+        int new_code_left = 0;
+        ensure_code_state();
+        if (line_in_code(cur_line)) {
+            new_code_left = old_code_left;
+            if (cur_col < new_code_left) new_code_left = cur_col;
+            if (cur_col >= new_code_left + SCREEN_COLS) new_code_left = cur_col - SCREEN_COLS + 1;
+        }
+        if (new_code_left != old_code_left) { request_full_redraw(); return; }
     }
-    request_cursor_redraw();
+    /* An active selection's highlighted range depends on the live cursor
+       position (see sel_line_range()), so any cursor move while selecting --
+       notably every vim Visual-mode motion below -- must repaint the whole
+       screen, not just the cursor/status line, or the highlight never
+       visibly follows the cursor. */
+    if (sel_active) request_full_redraw();
+    else request_cursor_redraw();
 }
 
 /* Grows top_line until the cursor's visual row lands within the TEXT_ROWS window. Raw Markdown view keeps the old exact-line-count logic. */
@@ -1161,6 +1261,19 @@ void scroll_to_cursor(void)
 
 /* ================= confined single-line edit wrappers ================= */
 
+/* The horizontal-scroll value relevant to line_no's current rendering:
+   left_col in Raw view (applies to the whole document), code_left_col for a
+   code line in Writer view. Wrapped prose lines don't scroll at all, so 0
+   is fine there -- it's never compared against once view_mode==0 and
+   line_in_code() is false. Callers must have called ensure_code_state()
+   first (line_rows()/get_line_wraps() already do, so it's safe right after
+   either of those). */
+int active_left_col(int line_no)
+{
+    if (view_mode == 1) return left_col;
+    return line_in_code(line_no) ? code_left_col : 0;
+}
+
 /* After a single-character edit, decides whether the effect stayed confined to one on-screen line and requests the cheap redraw_line_only() path if so, falling back to a full redraw if the line rewrapped, the viewport scrolled, or horizontal scroll shifted. */
 void redraw_after_char_edit(int line_no, int old_nrows, int old_top, int old_left)
 {
@@ -1174,7 +1287,10 @@ void redraw_after_char_edit(int line_no, int old_nrows, int old_top, int old_lef
     new_nrows = line_rows(line_no);
     if (new_nrows != old_nrows) { request_full_redraw(); return; }
 
-    if (view_mode == 1) {
+    /* old_left is left_col in Raw view or code_left_col for a code line in
+       Writer view (whichever the caller captured, via active_left_col()) --
+       wrapped prose lines don't scroll at all, so nothing to check there. */
+    if (view_mode == 1 || line_in_code(line_no)) {
         int new_left = old_left;
         if (cur_col < new_left) new_left = cur_col;
         if (cur_col >= new_left + SCREEN_COLS) new_left = cur_col - SCREEN_COLS + 1;
@@ -1192,7 +1308,7 @@ void do_insert_char(int ch)
     if (sel_active) { insert_char(ch); request_full_redraw(); return; }
     old_nrows = line_rows(line_no);
     old_top = top_line;
-    old_left = left_col;
+    old_left = active_left_col(line_no);
     if (!insert_char(ch)) return;   /* flash_error already requested full */
     redraw_after_char_edit(line_no, old_nrows, old_top, old_left);
 }
@@ -1214,7 +1330,7 @@ void do_backspace(void)
             } else {
                 old_nrows = line_rows(line_no);
                 old_top = top_line;
-                old_left = left_col;
+                old_left = active_left_col(line_no);
                 save_undo(line_no);
                 l->text[0] = '\0';
                 l->len = 0;
@@ -1235,7 +1351,7 @@ void do_backspace(void)
     }
     old_nrows = line_rows(line_no);
     old_top = top_line;
-    old_left = left_col;
+    old_left = active_left_col(line_no);
     backspace();
     redraw_after_char_edit(line_no, old_nrows, old_top, old_left);
 }
@@ -1253,7 +1369,7 @@ void do_delete_forward(void)
     }
     old_nrows = line_rows(line_no);
     old_top = top_line;
-    old_left = left_col;
+    old_left = active_left_col(line_no);
     delete_forward();
     redraw_after_char_edit(line_no, old_nrows, old_top, old_left);
 }
@@ -1338,7 +1454,7 @@ void do_list_indent(int dir)
 
     old_nrows = line_rows(line_no);
     old_top = top_line;
-    old_left = left_col;
+    old_left = active_left_col(line_no);
 
     delta = new_indent - indent;
     save_undo(line_no);
@@ -1594,8 +1710,8 @@ void draw_status_bar(void)
     clear_row(STATUS_ROW, attr);
 
     if (vim_mode) {
-        const char *mtxt = vim_insert ? " INSERT " : " NORMAL ";
-        unsigned char mattr = vim_insert ? ATTR_MODE_INSERT : ATTR_MODE_NORMAL;
+        const char *mtxt = vim_insert ? " INSERT " : (vim_visual == 2 ? " V-LINE " : (vim_visual == 1 ? " VISUAL " : " NORMAL "));
+        unsigned char mattr = vim_insert ? ATTR_MODE_INSERT : (vim_visual ? ATTR_MODE_VISUAL : ATTR_MODE_NORMAL);
         put_string(col, STATUS_ROW, mtxt, mattr);
         col += (int) strlen(mtxt) + 1;
     }
@@ -1688,8 +1804,11 @@ void draw_bottom_and_cursor(void)
             rows = 0;
             for (l = top_line; l < cur_line; l++) rows += line_rows(l);
             screen_row = rows + seg;
-            screen_col = writer_screen_col(doc[cur_line]->text, cur_col, in_code)
-                       - writer_screen_col(doc[cur_line]->text, starts[seg], in_code);
+            {
+                int seg_ref = in_code ? code_left_col : starts[seg];
+                screen_col = writer_screen_col(doc[cur_line]->text, cur_col, in_code)
+                           - writer_screen_col(doc[cur_line]->text, seg_ref, in_code);
+            }
         }
         if (screen_col < 0) screen_col = 0;
         if (screen_col >= SCREEN_COLS) screen_col = SCREEN_COLS - 1;
@@ -1722,8 +1841,9 @@ void redraw_line_only(int line_no)
             r = rows_above + seg;
             if (r >= TEXT_ROWS) break;
             {
+                int seg_start = in_code ? code_left_col : starts[seg];
                 int seg_end = (seg + 1 < n) ? starts[seg + 1] : doc[line_no]->len;
-                render_writer_line(doc[line_no]->text, r, starts[seg], seg_end, sel_start, sel_end, in_code);
+                render_writer_line(doc[line_no]->text, r, seg_start, seg_end, sel_start, sel_end, in_code);
             }
         }
     }
@@ -1753,8 +1873,18 @@ void redraw_screen(void)
     } else {
         /* Writer view: each buffer line may span several wrapped visual rows, so walk from top_line drawing every wrap segment until the screen fills. */
         left_col = 0;
-        r = 0; ln = top_line;
         ensure_code_state();
+        /* Code lines horizontal-scroll uniformly (same precedent as left_col
+           above) but only while the cursor is actually inside a fence --
+           leaving code snaps every code line back to column 0 so a block
+           you're not editing isn't left scrolled from an earlier visit. */
+        if (line_in_code(cur_line)) {
+            if (cur_col < code_left_col) code_left_col = cur_col;
+            if (cur_col >= code_left_col + SCREEN_COLS) code_left_col = cur_col - SCREEN_COLS + 1;
+        } else {
+            code_left_col = 0;
+        }
+        r = 0; ln = top_line;
         while (r < TEXT_ROWS) {
             if (ln >= doc_count) {
                 clear_row(r, ATTR_NORMAL);
@@ -1767,8 +1897,9 @@ void redraw_screen(void)
                 n = get_line_wraps(ln, starts);
                 sel_line_range(ln, doc[ln]->len, &sel_start, &sel_end);
                 for (seg = 0; seg < n && r < TEXT_ROWS; seg++, r++) {
+                    int seg_start = in_code ? code_left_col : starts[seg];
                     int seg_end = (seg + 1 < n) ? starts[seg + 1] : doc[ln]->len;
-                    render_writer_line(doc[ln]->text, r, starts[seg], seg_end, sel_start, sel_end, in_code);
+                    render_writer_line(doc[ln]->text, r, seg_start, seg_end, sel_start, sel_end, in_code);
                 }
             }
             ln++;
@@ -1876,7 +2007,7 @@ void load_file(const char *fname)
     if (doc_count == 0) { doc[0] = new_line(); doc_count = 1; }
     fclose(f);
     strcpy(filename, fname);
-    cur_line = cur_col = top_line = left_col = 0;
+    cur_line = cur_col = top_line = left_col = code_left_col = 0;
     modified = 0;
     undo_line_no = -1;
     sel_clear();
@@ -1907,6 +2038,7 @@ void cmd_copy(void)
     sel_bounds(&sl, &sc, &el, &ec);
     if (sl == el && sc == ec) { flash_status_for("Nothing selected.", FLASH_SECS(2)); return; }
 
+    vim_yank_linewise = 0;   /* a charwise selection copy always overwrites a prior linewise register */
     clip_len = 0;
     for (ln = sl; ln <= el; ln++) {
         from = (ln == sl) ? sc : 0;
@@ -2126,9 +2258,787 @@ void toggle_vim_mode(void)
 {
     vim_mode = !vim_mode;
     vim_insert = 0;    /* always start in Normal sub-mode when turning it on */
+    vim_replace = 0;
     vim_pending = 0;
+    vim_pending2 = 0;
+    vim_count = 0;
+    if (vim_visual) { vim_visual = 0; sel_clear(); }
     request_full_redraw();
     flash_status(vim_mode ? "Vim keys ON." : "Vim keys OFF.");
+}
+
+/* ---- vim word motions (w/b/e/W/B/E/ge/gE) ---- */
+
+/* vim's word classes: blank, "word" (alnum/underscore), or punctuation -- unless big is set (WORD variants: W/B/E/gE), in which case any non-blank is a single class, so words can contain punctuation. A run of same-class characters is one word for w/b/e; class changes (including into/out of blank) mark a boundary. */
+int vim_class(char c, int big)
+{
+    if (c == ' ' || c == '\t') return 0;
+    if (big) return 1;
+    if (isalnum((unsigned char) c) || c == '_') return 1;
+    return 2;
+}
+
+int vim_char_class(char c) { return vim_class(c, 0); }
+
+/* 'w'/'W': to the start of the next word, crossing lines when the current line runs out. An empty line counts as a word of its own, same as real vim, so it's a valid place to land rather than something to skip over. The "skip past the word we're currently sitting in" step only applies once, at the original position -- after crossing a line boundary, landing on that line's very first character is itself the destination, not something to skip past too. */
+void vim_word_forward_impl(int big)
+{
+    Line *l;
+    int cls;
+    int first = 1;
+    for (;;) {
+        l = doc[cur_line];
+        if (cur_col >= l->len) {
+            if (cur_line >= doc_count - 1) { cur_col = l->len; return; }
+            cur_line++; cur_col = 0;
+            first = 0;
+            if (doc[cur_line]->len == 0) return;
+            continue;
+        }
+        if (first) {
+            cls = vim_class(l->text[cur_col], big);
+            if (cls != 0) {
+                while (cur_col < l->len && vim_class(l->text[cur_col], big) == cls) cur_col++;
+            }
+            first = 0;
+        }
+        while (cur_col < l->len && vim_class(l->text[cur_col], big) == 0) cur_col++;
+        if (cur_col < l->len) return;
+        /* ran off the end while skipping blanks -- loop advances to the next line */
+    }
+}
+void vim_word_forward(void) { vim_word_forward_impl(0); }
+void vim_WORD_forward(void) { vim_word_forward_impl(1); }
+
+/* 'e'/'E': to the end of the current or next word (lands on its last character, not one past it). Always moves at least one column/line first, since standing on the last character of a word is itself a valid 'e' target one motion later. */
+void vim_word_end_impl(int big)
+{
+    Line *l = doc[cur_line];
+    int cls;
+
+    if (cur_col + 1 < l->len) {
+        cur_col++;
+    } else if (cur_line < doc_count - 1) {
+        cur_line++; cur_col = 0;
+    } else {
+        cur_col = (l->len > 0) ? l->len - 1 : 0;
+        return;
+    }
+
+    for (;;) {
+        l = doc[cur_line];
+        while (cur_col < l->len && vim_class(l->text[cur_col], big) == 0) cur_col++;
+        if (cur_col >= l->len) {
+            if (cur_line >= doc_count - 1) { cur_col = (l->len > 0) ? l->len - 1 : 0; return; }
+            cur_line++; cur_col = 0;
+            continue;
+        }
+        cls = vim_class(l->text[cur_col], big);
+        while (cur_col + 1 < l->len && vim_class(l->text[cur_col + 1], big) == cls) cur_col++;
+        return;
+    }
+}
+void vim_word_end(void) { vim_word_end_impl(0); }
+void vim_WORD_end(void) { vim_word_end_impl(1); }
+
+/* 'b'/'B': to the start of the previous word, crossing lines backward the same way vim_word_forward() crosses forward. */
+void vim_word_back_impl(int big)
+{
+    Line *l;
+    int cls;
+    for (;;) {
+        l = doc[cur_line];
+        if (cur_col == 0) {
+            if (cur_line == 0) return;
+            cur_line--;
+            cur_col = doc[cur_line]->len;
+            if (doc[cur_line]->len == 0) return;
+            continue;
+        }
+        cur_col--;
+        l = doc[cur_line];
+        while (cur_col > 0 && vim_class(l->text[cur_col], big) == 0) cur_col--;
+        if (vim_class(l->text[cur_col], big) == 0) continue;   /* whole line up to here was blank */
+        cls = vim_class(l->text[cur_col], big);
+        while (cur_col > 0 && vim_class(l->text[cur_col - 1], big) == cls) cur_col--;
+        return;
+    }
+}
+void vim_word_back(void) { vim_word_back_impl(0); }
+void vim_WORD_back(void) { vim_word_back_impl(1); }
+
+/* 'ge'/'gE': to the end of the previous word. First skips backward past whatever run we're currently standing inside (mirrors vim_word_forward_impl's "first" skip, just backward) -- otherwise stepping back one character from mid-word would land on another character of that SAME word and stop there, short of the actual previous word. Once clear of the starting run, it scans backward one character at a time (crossing lines the same way as 'b') and stops the moment it lands on a non-blank -- since we approach from the right, the first non-blank found after that is already the previous word's last character, with no further extension needed (unlike 'b', which keeps going to the run's start). */
+void vim_word_end_back_impl(int big)
+{
+    Line *l = doc[cur_line];
+    int start_cls = (cur_col < l->len) ? vim_class(l->text[cur_col], big) : 0;
+
+    for (;;) {
+        l = doc[cur_line];
+        if (cur_col == 0) {
+            if (cur_line == 0) return;
+            cur_line--;
+            cur_col = doc[cur_line]->len;
+            start_cls = 0;   /* crossing a line always leaves whatever run we started in */
+            if (doc[cur_line]->len == 0) return;
+            continue;
+        }
+        cur_col--;
+        l = doc[cur_line];
+        if (start_cls != 0 && vim_class(l->text[cur_col], big) == start_cls) continue;   /* still inside the run we started in */
+        start_cls = 0;
+        if (vim_class(l->text[cur_col], big) != 0) return;
+    }
+}
+void vim_word_end_back(void) { vim_word_end_back_impl(0); }
+void vim_WORD_end_back(void) { vim_word_end_back_impl(1); }
+
+/* '%': jump to the character matching the first bracket found at or after the cursor on the CURRENT line only (real vim's behavior -- it doesn't search other lines for a bracket to start from), then scans forward or backward across the whole document, tracking nesting depth, for its partner. A no-op if there's no bracket on the line, or no partner is found (unbalanced document). */
+int vim_bracket_partner(int c, int *is_open)
+{
+    switch (c) {
+        case '(': *is_open = 1; return ')';
+        case ')': *is_open = 0; return '(';
+        case '[': *is_open = 1; return ']';
+        case ']': *is_open = 0; return '[';
+        case '{': *is_open = 1; return '}';
+        case '}': *is_open = 0; return '{';
+        default: return 0;
+    }
+}
+
+void vim_match_pair(void)
+{
+    Line *l = doc[cur_line];
+    int col = -1, i, is_open, partner, depth;
+    int ln, c;
+
+    for (i = cur_col; i < l->len; i++) {
+        if (vim_bracket_partner((unsigned char) l->text[i], &is_open)) { col = i; break; }
+    }
+    if (col < 0) return;
+
+    partner = vim_bracket_partner((unsigned char) l->text[col], &is_open);
+    depth = 1;
+    ln = cur_line;
+    c = col;
+
+    if (is_open) {
+        for (;;) {
+            c++;
+            if (c >= doc[ln]->len) {
+                ln++; c = 0;
+                if (ln >= doc_count) return;
+                if (doc[ln]->len == 0) continue;
+            }
+            if ((unsigned char) doc[ln]->text[c] == l->text[col]) depth++;
+            else if ((unsigned char) doc[ln]->text[c] == partner) {
+                depth--;
+                if (depth == 0) { cur_line = ln; cur_col = c; return; }
+            }
+        }
+    } else {
+        for (;;) {
+            c--;
+            if (c < 0) {
+                ln--;
+                if (ln < 0) return;
+                c = doc[ln]->len - 1;
+                if (c < 0) continue;
+            }
+            if ((unsigned char) doc[ln]->text[c] == l->text[col]) depth++;
+            else if ((unsigned char) doc[ln]->text[c] == partner) {
+                depth--;
+                if (depth == 0) { cur_line = ln; cur_col = c; return; }
+            }
+        }
+    }
+}
+
+/* Consumes any pending count (defaulting to 1) for the command about to run. */
+int vim_take_count(void)
+{
+    int n = (vim_count > 0) ? vim_count : 1;
+    vim_count = 0;
+    return n;
+}
+
+/* '^': first non-blank character of the line (its end if the line is all blank). */
+void vim_first_nonblank(void)
+{
+    Line *l = doc[cur_line];
+    int i = 0;
+    while (i < l->len && (l->text[i] == ' ' || l->text[i] == '\t')) i++;
+    cur_col = i;
+}
+
+/* 'g_': last non-blank character of the line (column 0 if empty/all blank). */
+void vim_last_nonblank(void)
+{
+    Line *l = doc[cur_line];
+    int i = l->len - 1;
+    while (i > 0 && (l->text[i] == ' ' || l->text[i] == '\t')) i--;
+    cur_col = (i < 0) ? 0 : i;
+}
+
+/* 'gg' (bare, or NgG for line N): first non-blank of line N, or line 1 with no count. Takes the target line directly from vim_count rather than repeating a single-line-step motion N times, since a count here means "go to line N", not "repeat N times". */
+void vim_move_gg(void)
+{
+    int n = vim_take_count();
+    cur_line = n - 1;
+    if (cur_line < 0) cur_line = 0;
+    if (cur_line >= doc_count) cur_line = doc_count - 1;
+    vim_first_nonblank();
+}
+
+/* 'G' (bare, or NG for line N): first non-blank of line N, or the last line with no count. */
+void vim_move_G(void)
+{
+    int n = vim_count;
+    vim_count = 0;
+    cur_line = (n > 0) ? n - 1 : doc_count - 1;
+    if (cur_line < 0) cur_line = 0;
+    if (cur_line >= doc_count) cur_line = doc_count - 1;
+    vim_first_nonblank();
+}
+
+/* '}'/'{': jump to the next/previous blank line (a paragraph break). Skips a run of blank lines already under the cursor first, so repeated presses keep advancing instead of getting stuck. */
+void vim_paragraph_forward(void)
+{
+    int ln = cur_line;
+    while (ln < doc_count - 1 && doc[ln]->len == 0) ln++;
+    while (ln < doc_count - 1 && doc[ln]->len != 0) ln++;
+    cur_line = ln;
+    cur_col = 0;
+}
+void vim_paragraph_back(void)
+{
+    int ln = cur_line;
+    while (ln > 0 && doc[ln]->len == 0) ln--;
+    while (ln > 0 && doc[ln]->len != 0) ln--;
+    cur_line = ln;
+    cur_col = 0;
+}
+
+/* The range of logical lines currently visible, walking from top_line the same way redraw_screen()/page_down() do -- used by H/M/L below. */
+void vim_visible_range(int *first, int *last)
+{
+    int rows = 0, ln = top_line;
+    *first = top_line;
+    *last = top_line;
+    for (;;) {
+        *last = ln;
+        if (ln >= doc_count - 1) break;
+        rows += line_rows(ln);
+        if (rows >= TEXT_ROWS) break;
+        ln++;
+    }
+}
+
+/* 'H'/'M'/'L': top/middle/bottom of the visible screen, landing on the first non-blank like real vim. */
+void vim_move_screen_top(void)    { int f, l; vim_visible_range(&f, &l); cur_line = f; vim_first_nonblank(); }
+void vim_move_screen_bottom(void) { int f, l; vim_visible_range(&f, &l); cur_line = l; vim_first_nonblank(); }
+void vim_move_screen_middle(void) { int f, l; vim_visible_range(&f, &l); cur_line = f + (l - f) / 2; vim_first_nonblank(); }
+
+/* 'zz'/'zt'/'zb': re-center the viewport on the cursor's line without moving the cursor. Called directly rather than through do_move(), which short-circuits when cur_line/cur_col don't change -- here only top_line does. */
+void vim_scroll_center(void)
+{
+    top_line = cur_line - TEXT_ROWS / 2;
+    if (top_line < 0) top_line = 0;
+    if (top_line >= doc_count) top_line = doc_count - 1;
+}
+void vim_scroll_top(void) { top_line = cur_line; }
+void vim_scroll_bottom(void)
+{
+    int rows = 0, ln = cur_line;
+    while (ln > 0 && rows < TEXT_ROWS - 1) { ln--; rows += line_rows(ln); }
+    top_line = ln;
+}
+
+/* Ctrl+e/Ctrl+y: scroll the viewport by one line, nudging the cursor back on screen if it would otherwise scroll off. Called directly, same reasoning as the z-commands above. */
+void vim_scroll_line_down(void)
+{
+    if (top_line >= doc_count - 1) return;
+    top_line++;
+    if (cur_line < top_line) cur_line = top_line;
+}
+void vim_scroll_line_up(void)
+{
+    if (top_line <= 0) return;
+    top_line--;
+    if (cur_line > top_line + TEXT_ROWS - 1) cur_line = top_line + TEXT_ROWS - 1;
+    if (cur_line >= doc_count) cur_line = doc_count - 1;
+}
+
+/* Ctrl+d/Ctrl+u: half-page down/up, same shape as page_down()/page_up() but TEXT_ROWS/2. */
+void vim_half_page_down(void)
+{
+    if (view_mode == 1) {
+        cur_line += TEXT_ROWS / 2;
+        if (cur_line >= doc_count) cur_line = doc_count - 1;
+    } else {
+        int rows = 0;
+        while (cur_line < doc_count - 1 && rows < TEXT_ROWS / 2) {
+            rows += line_rows(cur_line);
+            cur_line++;
+        }
+    }
+    if (cur_col > doc[cur_line]->len) cur_col = doc[cur_line]->len;
+}
+void vim_half_page_up(void)
+{
+    if (view_mode == 1) {
+        cur_line -= TEXT_ROWS / 2;
+        if (cur_line < 0) cur_line = 0;
+    } else {
+        int rows = 0;
+        while (cur_line > 0 && rows < TEXT_ROWS / 2) {
+            cur_line--;
+            rows += line_rows(cur_line);
+        }
+    }
+    if (cur_col > doc[cur_line]->len) cur_col = doc[cur_line]->len;
+}
+
+/* f/F/t/T + ;/,: find (or "till") a character on the current line only -- vim's line-bound char search, distinct from the multi-line Ctrl+F search. vim_last_find_cmd/_char double as both "what's pending" during the two-key entry and "what to repeat" for ;/, afterward, since only one can be true at a time. */
+void vim_apply_find(void)
+{
+    Line *l = doc[cur_line];
+    int i;
+    if (vim_last_find_cmd == 'f' || vim_last_find_cmd == 't') {
+        for (i = cur_col + 1; i < l->len; i++) {
+            if ((unsigned char) l->text[i] == vim_last_find_char) {
+                cur_col = (vim_last_find_cmd == 't') ? i - 1 : i;
+                return;
+            }
+        }
+    } else if (vim_last_find_cmd == 'F' || vim_last_find_cmd == 'T') {
+        for (i = cur_col - 1; i >= 0; i--) {
+            if ((unsigned char) l->text[i] == vim_last_find_char) {
+                cur_col = (vim_last_find_cmd == 'T') ? i + 1 : i;
+                return;
+            }
+        }
+    }
+    /* not found on this line: no-op, same as real vim */
+}
+
+/* ',': repeat the last f/F/t/T in the opposite direction, by temporarily flipping f<->F / t<->T for one call. */
+void vim_apply_find_reverse(void)
+{
+    int saved = vim_last_find_cmd;
+    if (saved == 'f') vim_last_find_cmd = 'F';
+    else if (saved == 'F') vim_last_find_cmd = 'f';
+    else if (saved == 't') vim_last_find_cmd = 'T';
+    else if (saved == 'T') vim_last_find_cmd = 't';
+    vim_apply_find();
+    vim_last_find_cmd = saved;
+}
+
+/* ---- vim line-wise yank/delete/put (yy, dd, p/P on a line-wise register) ---- */
+
+/* Copies up to `count` lines starting at line_no into the clipboard, one buffer line per '\n'-terminated chunk including a trailing '\n' after the last one -- that trailing newline is what marks the register line-wise for vim_put(). Used by both 'yy' (yank only) and 'dd' (yank-then-delete, same as real vim's cut-is-a-yank). */
+void yank_lines(int line_no, int count)
+{
+    int i, n = count, take;
+    Line *l;
+    if (n < 1) n = 1;
+    if (line_no + n > doc_count) n = doc_count - line_no;
+    clip_len = 0;
+    for (i = 0; i < n; i++) {
+        l = doc[line_no + i];
+        take = l->len;
+        if (clip_len + take + 1 >= CLIP_MAX) break;
+        memcpy(clipboard + clip_len, l->text, (size_t) take);
+        clip_len += take;
+        clipboard[clip_len++] = '\n';
+    }
+    clipboard[clip_len] = '\0';
+    vim_yank_linewise = 1;
+}
+
+/* Inserts the clipboard's line-wise register as whole new lines below (dir > 0) or above (dir <= 0) cur_line, for 'p'/'P' after a yy/dd/Visual-Line yank. Cursor lands at the start of the first inserted line, same as vim. */
+void vim_put_lines(int dir)
+{
+    int insert_at = (dir > 0) ? cur_line + 1 : cur_line;
+    int count = 0, i, nlines = 0;
+    for (i = 0; i < clip_len; i++) if (clipboard[i] == '\n') count++;
+    if (count == 0) return;   /* not actually a line-wise register */
+    if (doc_count + count > MAX_LINES) { flash_error("Document full."); return; }
+
+    memmove(&doc[insert_at + count], &doc[insert_at],
+            (size_t) (doc_count - insert_at) * sizeof(Line *));
+    doc_count += count;
+
+    i = 0;
+    while (nlines < count) {
+        Line *nl = new_line();
+        int len = 0;
+        while (i < clip_len && clipboard[i] != '\n' && len < MAX_LINE_LEN) {
+            nl->text[len++] = clipboard[i++];
+        }
+        nl->text[len] = '\0';
+        nl->len = len;
+        doc[insert_at + nlines] = nl;
+        nlines++;
+        i++;   /* skip the '\n' */
+    }
+
+    cur_line = insert_at;
+    cur_col = 0;
+    modified = 1;
+    code_state_valid = 0;
+    request_full_redraw();
+}
+
+/* p/P: put the last yank/delete after (dir > 0) or before (dir <= 0) the cursor. A line-wise register (yy/dd/Visual Line) always inserts as new line(s); anything else pastes inline at the cursor, reusing cmd_paste() -- stepping one column right first for 'p' so it lands after the cursor's character rather than before it, matching vim's charwise put. */
+void vim_put(int dir)
+{
+    if (clip_len == 0) { flash_status_for("Clipboard empty.", FLASH_SECS(2)); return; }
+    if (vim_yank_linewise) {
+        vim_put_lines(dir);
+    } else {
+        if (dir > 0 && doc[cur_line]->len > 0) do_move(move_right);
+        cmd_paste();
+    }
+}
+
+/* Visual-mode d/x ('d') or y ('y'): act on the live selection instead of a count, then always leave Visual sub-mode, same as real vim. Visual Line (V) yanks/deletes whole lines; Visual charwise (v) reuses cmd_copy()/cmd_cut() exactly as Ctrl+C/Ctrl+X already do. */
+void vim_visual_operate(int op)
+{
+    int sl, sc, el, ec, i;
+    sel_bounds(&sl, &sc, &el, &ec);
+    if (vim_visual == 2) {
+        cur_line = sl;
+        cur_col = 0;
+        yank_lines(sl, el - sl + 1);
+        if (op == 'y') {
+            flash_status("Yanked.");
+        } else {
+            for (i = 0; i <= el - sl; i++) delete_current_line();
+        }
+    } else {
+        if (op == 'y') cmd_copy();
+        else cmd_cut();
+    }
+    vim_visual = 0;
+    sel_clear();
+    request_full_redraw();
+}
+
+/* Visual 'o': swap which end of the selection the cursor sits on, so movement now extends the OTHER side -- the anchor and the live cursor position simply trade places. */
+void vim_visual_swap_ends(void)
+{
+    int tl = anchor_line, tc = anchor_col;
+    anchor_line = cur_line; anchor_col = cur_col;
+    cur_line = tl; cur_col = tc;
+    request_full_redraw();
+}
+
+/* Visual '~'/'u'/'U': change the case of the selected text in place (mode: 0 toggle, 1 lowercase, 2 uppercase). */
+void vim_visual_case(int mode)
+{
+    int sl, sc, el, ec, ln, start, end;
+    sel_bounds(&sl, &sc, &el, &ec);
+    for (ln = sl; ln <= el; ln++) {
+        Line *l = doc[ln];
+        sel_line_range(ln, l->len, &start, &end);
+        if (start < 0) continue;
+        {
+            int i;
+            for (i = start; i < end; i++) {
+                unsigned char c = (unsigned char) l->text[i];
+                if (mode == 0) l->text[i] = (char) (islower(c) ? toupper(c) : (isupper(c) ? tolower(c) : c));
+                else if (mode == 1) l->text[i] = (char) tolower(c);
+                else l->text[i] = (char) toupper(c);
+            }
+        }
+        line_mark_dirty(l);
+    }
+    cur_line = sl; cur_col = sc;
+    vim_visual = 0;
+    sel_clear();
+    modified = 1;
+    code_state_valid = 0;
+    request_full_redraw();
+}
+
+/* 'o': open a new line below and enter Insert -- move to end of line first so split_line() (via do_split_line(), which also continues a list marker) produces a fresh empty line right after. */
+/* 'O': open a new line above and enter Insert. No existing helper does this in reverse, so it's a small dedicated insert-a-blank-line-at-cur_line. */
+void vim_open_above(void)
+{
+    if (doc_count >= MAX_LINES) { flash_error("Document full."); return; }
+    memmove(&doc[cur_line + 1], &doc[cur_line], (size_t) (doc_count - cur_line) * sizeof(Line *));
+    doc[cur_line] = new_line();
+    doc_count++;
+    cur_col = 0;
+    modified = 1;
+    undo_line_no = -1;
+    code_state_valid = 0;
+    request_full_redraw();
+}
+
+/* ---- vim text objects: iw/aw (word), ib/ab and iB/aB (bracket blocks) ----
+   Single-line only -- a deliberate simplification of real vim's multi-line-
+   aware text objects, in keeping with this editor's line-oriented model. */
+
+/* 'iw': the run of same-class characters (vim's small-word classes) the cursor sits on -- if that's a run of blanks, iw selects the blanks themselves, same as real vim. */
+void vim_word_object_bounds(int *start, int *end)
+{
+    Line *l = doc[cur_line];
+    int cls, i;
+    if (cur_col >= l->len) { *start = l->len; *end = l->len; return; }
+    cls = vim_char_class(l->text[cur_col]);
+    i = cur_col;
+    while (i > 0 && vim_char_class(l->text[i - 1]) == cls) i--;
+    *start = i;
+    i = cur_col;
+    while (i + 1 < l->len && vim_char_class(l->text[i + 1]) == cls) i++;
+    *end = i + 1;
+}
+
+/* 'aw': iw's range plus the blank run after it, or (if there's none) the blank run before it -- real vim's exact fallback rule. */
+void vim_a_word_bounds(int *start, int *end)
+{
+    Line *l = doc[cur_line];
+    int cls;
+    vim_word_object_bounds(start, end);
+    cls = (*start < l->len) ? vim_char_class(l->text[*start]) : 0;
+    if (cls != 0) {
+        int e = *end;
+        while (e < l->len && vim_char_class(l->text[e]) == 0) e++;
+        if (e > *end) { *end = e; return; }
+        {
+            int s = *start;
+            while (s > 0 && vim_char_class(l->text[s - 1]) == 0) s--;
+            *start = s;
+        }
+    }
+}
+
+/* 'ib'/'ab'/'iB'/'aB': the innermost (open,close) pair enclosing cur_col on the current line. Returns 0 if cur_col isn't inside such a pair here. a=1 widens the range to include the delimiters themselves. */
+int vim_block_object_bounds(char open, char close, int a, int *start, int *end)
+{
+    Line *l = doc[cur_line];
+    int i, depth, open_col = -1, close_col = -1;
+
+    depth = 0;
+    for (i = cur_col; i >= 0; i--) {
+        if (l->text[i] == close) depth++;
+        else if (l->text[i] == open) {
+            if (depth == 0) { open_col = i; break; }
+            depth--;
+        }
+    }
+    if (open_col < 0) return 0;
+
+    depth = 0;
+    for (i = open_col + 1; i < l->len; i++) {
+        if (l->text[i] == open) depth++;
+        else if (l->text[i] == close) {
+            if (depth == 0) { close_col = i; break; }
+            depth--;
+        }
+    }
+    if (close_col < 0) return 0;
+
+    if (a) { *start = open_col; *end = close_col + 1; }
+    else   { *start = open_col + 1; *end = close_col; }
+    return 1;
+}
+
+/* Sets the active selection to a raw [start,end) column range on the current line -- end is already exclusive, matching how sel_line_range()/rendering already treat the live cursor column as the selection's (excluded) edge, so this drops straight into the existing selection machinery. */
+void vim_select_object(int start, int end)
+{
+    anchor_line = cur_line;
+    anchor_col = start;
+    cur_col = end;
+    sel_active = 1;
+    sel_linewise = 0;
+}
+
+/* Visual iw/aw: replace the current selection with the word object under the cursor (this is exactly what typing "viw" means -- select, then immediately narrow to the object). */
+void vim_apply_word_object(int a)
+{
+    int start, end;
+    if (a) vim_a_word_bounds(&start, &end); else vim_word_object_bounds(&start, &end);
+    vim_select_object(start, end);
+    request_full_redraw();
+}
+
+/* Visual ib/ab/iB/aB: same idea, for the enclosing bracket pair. No-op (selection unchanged) if the cursor isn't inside one on this line. */
+void vim_apply_block_object(char open, char close, int a)
+{
+    int start, end;
+    if (vim_block_object_bounds(open, close, a, &start, &end)) {
+        vim_select_object(start, end);
+        request_full_redraw();
+    }
+}
+
+/* r: replace the single character under the cursor with the next key typed (any printable character; anything else cancels without changing the text). No count support -- a minor, honestly-scoped simplification (real vim's "3rx" replaces 3 characters). */
+void vim_apply_replace_char(int ch)
+{
+    if (ch >= 32 && ch < 127 && cur_col < doc[cur_line]->len) {
+        save_undo(cur_line);
+        doc[cur_line]->text[cur_col] = (char) ch;
+        line_mark_dirty(doc[cur_line]);
+        modified = 1;
+        code_state_valid = 0;
+        request_full_redraw();
+    }
+}
+
+/* R (Replace sub-mode): typed characters overwrite instead of insert, until Esc returns to Normal (sharing vim_insert's Esc handling; see vim_replace's comment at its declaration for the Backspace simplification). Falls back to a normal insert once the cursor reaches the end of the line, same as real vim. */
+void do_replace_char(int ch)
+{
+    Line *l = doc[cur_line];
+    if (cur_col < l->len) {
+        save_undo(cur_line);
+        l->text[cur_col] = (char) ch;
+        line_mark_dirty(l);
+        cur_col++;
+        modified = 1;
+        request_full_redraw();
+    } else {
+        do_insert_char(ch);
+    }
+}
+
+/* J/gJ: join the next line onto the current one. with_space (J) strips the next line's leading blanks and inserts exactly one space at the join point (unless the current line is empty, or there's nothing left on the next line to join); gJ (with_space=0) joins verbatim with no space and no blank-stripping. */
+void vim_join_lines(int with_space)
+{
+    Line *l, *next;
+    int i, dest, cursor_at;
+    if (cur_line >= doc_count - 1) return;
+    save_undo(cur_line);
+    l = doc[cur_line];
+    next = doc[cur_line + 1];
+    dest = l->len;
+    i = 0;
+    if (with_space) {
+        while (i < next->len && (next->text[i] == ' ' || next->text[i] == '\t')) i++;
+        if (dest > 0 && l->text[dest - 1] != ' ' && i < next->len && dest < MAX_LINE_LEN) {
+            l->text[dest++] = ' ';
+        }
+    }
+    cursor_at = dest;
+    while (i < next->len && dest < MAX_LINE_LEN) l->text[dest++] = next->text[i++];
+    l->text[dest] = '\0';
+    l->len = dest;
+    line_mark_dirty(l);
+    free(next);
+    memmove(&doc[cur_line + 1], &doc[cur_line + 2],
+            (size_t) (doc_count - cur_line - 2) * sizeof(Line *));
+    doc_count--;
+    cur_col = cursor_at;
+    modified = 1;
+    code_state_valid = 0;
+    request_full_redraw();
+}
+void vim_join(void)  { vim_join_lines(1); }
+void vim_gjoin(void) { vim_join_lines(0); }
+
+/* cc/S: clear the current line's text and enter Insert at column 0. */
+void vim_change_line(void)
+{
+    save_undo(cur_line);
+    doc[cur_line]->text[0] = '\0';
+    doc[cur_line]->len = 0;
+    line_mark_dirty(doc[cur_line]);
+    cur_col = 0;
+    vim_insert = 1;
+    modified = 1;
+    code_state_valid = 0;
+    request_full_redraw();
+}
+
+/* C/c$: delete from the cursor to the end of the line, then enter Insert there. */
+void vim_change_to_eol(void)
+{
+    save_undo(cur_line);
+    doc[cur_line]->text[cur_col] = '\0';
+    doc[cur_line]->len = cur_col;
+    line_mark_dirty(doc[cur_line]);
+    vim_insert = 1;
+    modified = 1;
+    code_state_valid = 0;
+    request_full_redraw();
+}
+
+/* D/d$: delete from the cursor to the end of the line (no insert afterward). */
+void vim_delete_to_eol(void)
+{
+    save_undo(cur_line);
+    doc[cur_line]->text[cur_col] = '\0';
+    doc[cur_line]->len = cur_col;
+    line_mark_dirty(doc[cur_line]);
+    modified = 1;
+    code_state_valid = 0;
+    request_full_redraw();
+}
+
+/* cw/ce: real vim's well-known special case -- cw on a non-blank character behaves exactly like ce (change to the end of the current word), not like dw+insert (which would also eat the trailing blanks). Clamped to the current line, same as vim_select_object's other single-line text objects. */
+void vim_change_word(void)
+{
+    int start = cur_col, end;
+    int save_line = cur_line;
+    vim_word_end();
+    end = (cur_line == save_line) ? cur_col + 1 : doc[save_line]->len;
+    cur_line = save_line;
+    cur_col = start;
+    vim_select_object(start, end);
+    cmd_cut();
+    vim_insert = 1;
+}
+
+/* dw/yw: operator + word-motion (as opposed to iw/aw's operator + text-object). Clamped to the current line -- real vim does the same when the word motion would otherwise cross into the next line, so dw/yw never eats the newline. */
+void vim_word_motion_bounds(int *start, int *end)
+{
+    int save_line = cur_line, save_col = cur_col;
+    Line *l = doc[cur_line];
+    *start = cur_col;
+    vim_word_forward();
+    *end = (cur_line == save_line) ? cur_col : l->len;
+    cur_line = save_line;
+    cur_col = save_col;
+}
+
+/* x, fixed to also yank the deleted character(s) into the clipboard (charwise), so a following 'p' composes into the classic "xp" transpose -- matches real vim, where x's target register isn't empty. */
+void vim_delete_chars_yank(int n)
+{
+    Line *l = doc[cur_line];
+    int end_col = cur_col + n, take;
+    if (end_col > l->len) end_col = l->len;
+    take = end_col - cur_col;
+    if (take > 0) {
+        if (take > CLIP_MAX - 1) take = CLIP_MAX - 1;
+        memcpy(clipboard, l->text + cur_col, (size_t) take);
+        clipboard[take] = '\0';
+        clip_len = take;
+        vim_yank_linewise = 0;
+    }
+}
+
+/* Ctrl+w (Insert mode): delete the word before the cursor, shell-style -- skips any blanks immediately before the cursor, then the word/punct run before that. At the start of a line (nothing on this line to eat), it falls back to a plain Backspace, joining with the previous line like real vim does. */
+void do_delete_word_back(void)
+{
+    Line *l = doc[cur_line];
+    int start = cur_col;
+    if (cur_col == 0) { do_backspace(); return; }
+    while (start > 0 && (l->text[start - 1] == ' ' || l->text[start - 1] == '\t')) start--;
+    if (start > 0) {
+        int cls = vim_char_class(l->text[start - 1]);
+        while (start > 0 && vim_char_class(l->text[start - 1]) == cls) start--;
+    }
+    save_undo(cur_line);
+    memmove(l->text + start, l->text + cur_col, (size_t) (l->len - cur_col + 1));
+    l->len -= (cur_col - start);
+    line_mark_dirty(l);
+    cur_col = start;
+    modified = 1;
+    code_state_valid = 0;
+    request_full_redraw();
 }
 
 /* Minimal ":" command line: :w save, :q quit, :wq save+quit, :q! quit without saving. Nothing beyond these four. */
@@ -2356,13 +3266,13 @@ int main(int argc, char **argv)
 
         /* ---- normal editing mode ---- */
         if (vim_mode && !vim_insert && lo != 0) {
-            /* Vim Normal sub-mode. Plain letter/punctuation keys are commands here, not text -- Ctrl-shortcuts, Enter, and Backspace still work the same as non-vim mode. */
-            if (lo == 13) do_split_line();
+            /* Vim Normal/Visual sub-mode. Plain letter/punctuation keys are commands here, not text -- Ctrl-shortcuts and Backspace still work the same as non-vim mode, in or out of Visual. Enter is different: real vim's Normal-mode Enter is a motion (like '+'), moving to the next line's first non-blank rather than splitting the line -- only Insert/Replace sub-mode should split on Enter (handled in the shared key handling below). */
+            if (lo == 13) { do_move(move_down); do_move(vim_first_nonblank); vim_pending = 0; vim_count = 0; }
             else if (lo == 8)  do_backspace();
             else if (lo == 1)  cmd_save_as();
             else if (lo == 6)  cmd_find();
             else if (lo == 7)  cmd_goto();
-            else if (lo == 18) cmd_replace();
+            else if (lo == 18) do_redo();   /* Ctrl+r is vim's real redo key -- see the Ctrl+p note below for where Replace moved to, in this sub-mode only */
             else if (lo == 14) cmd_new();
             else if (lo == 15) cmd_open();
             else if (lo == 19) cmd_save();
@@ -2370,21 +3280,192 @@ int main(int argc, char **argv)
             else if (lo == 24) cmd_cut();
             else if (lo == 22) cmd_paste();
             else if (lo == 26) do_undo();
-            else if (lo == 9)  { do_list_indent(1); vim_pending = 0; }
-            else if (vim_pending == 'd' && lo == 'd') { delete_current_line(); vim_pending = 0; }
-            else if (lo == 'h') { do_move(move_left);  vim_pending = 0; }
-            else if (lo == 'l') { do_move(move_right); vim_pending = 0; }
-            else if (lo == 'k') { do_move(move_up);    vim_pending = 0; }
-            else if (lo == 'j') { do_move(move_down);  vim_pending = 0; }
-            else if (lo == '0') { do_move(move_home);  vim_pending = 0; }
-            else if (lo == '$') { do_move(move_end);   vim_pending = 0; }
-            else if (lo == 'x') { do_delete_forward(); vim_pending = 0; }
-            else if (lo == 'u') { do_undo();        vim_pending = 0; }
-            else if (lo == 'i') { vim_insert = 1;   vim_pending = 0; request_full_redraw(); }
-            else if (lo == 'a') { do_move(move_right); vim_insert = 1; vim_pending = 0; request_full_redraw(); }
+            else if (lo == 9)  { do_list_indent(1); vim_pending = 0; vim_count = 0; }
+            /* Replace, bumped off Ctrl+r by real vim's redo binding just above -- Ctrl+p substitutes, since nothing else claims it. Outside this sub-mode (Insert, or vim mode off) Ctrl+r is still Replace, unchanged, below in the shared key handling. */
+            else if (lo == 16) cmd_replace();
+            /* Half-page and one-line scrolling (Ctrl+d/u, Ctrl+e/y). Ctrl+b/Ctrl+f (full page) are left unbound: Ctrl+f is already Find above, and PgUp/PgDn already do this regardless of vim mode, so there is no plain everyday key left to pair symmetrically with Ctrl+b alone. */
+            else if (lo == 4)  { do_move(vim_half_page_down); vim_pending = 0; vim_count = 0; }
+            else if (lo == 21) { do_move(vim_half_page_up);   vim_pending = 0; vim_count = 0; }
+            else if (lo == 5)  { vim_scroll_line_down(); request_full_redraw(); vim_pending = 0; vim_count = 0; }
+            else if (lo == 25) { vim_scroll_line_up();   request_full_redraw(); vim_pending = 0; vim_count = 0; }
+
+            /* r: the NEXT key typed is the literal replacement character (or cancels, if it isn't printable) -- this must run before every other check below so a stray 'd', digit, etc. right after 'r' is taken literally, not as a new command. */
+            else if (vim_pending == 'r') { vim_apply_replace_char(lo); vim_pending = 0; }
+            /* f/F/t/T: same idea -- the next key is a literal search target, not a command. */
+            else if (vim_pending == 'f' || vim_pending == 'F' || vim_pending == 't' || vim_pending == 'T') {
+                vim_last_find_cmd = vim_pending;
+                vim_last_find_char = lo;
+                vim_pending = 0;
+                do_move(vim_apply_find);
+            }
+
+            /* Count prefix: 1-9 always starts/extends it; 0 only continues one already started, so a bare 0 still falls through to the "start of line" motion further down. */
+            else if (lo >= '1' && lo <= '9') { vim_count = vim_count * 10 + (lo - '0'); }
+            else if (lo == '0' && vim_count > 0) { vim_count = vim_count * 10; }
+
+            else if (lo == 27) {
+                /* No macros, so Esc's only job here is cancelling Visual -- this pre-empts the plain-selection Esc case further below since vim_mode && !vim_insert already matches lo!=0 first. */
+                if (vim_visual) { vim_visual = 0; sel_clear(); request_full_redraw(); }
+                vim_pending = 0; vim_pending2 = 0; vim_count = 0;
+            }
+
+            else if (lo == 'v') {
+                if (vim_visual == 1) { vim_visual = 0; sel_clear(); }
+                else { vim_visual = 1; sel_linewise = 0; sel_begin(); }
+                vim_pending = 0; vim_count = 0; request_full_redraw();
+            }
+            else if (lo == 'V') {
+                if (vim_visual == 2) { vim_visual = 0; sel_clear(); }
+                else { vim_visual = 2; sel_linewise = 1; sel_begin(); }
+                vim_pending = 0; vim_count = 0; request_full_redraw();
+            }
+
+            /* Visual text objects: iw/aw/ib/ab/iB/aB replace the current selection with that object -- exactly what "viw" etc. means. */
+            else if (vim_visual && vim_pending == 'i' && lo == 'w') { vim_apply_word_object(0); vim_pending = 0; }
+            else if (vim_visual && vim_pending == 'a' && lo == 'w') { vim_apply_word_object(1); vim_pending = 0; }
+            else if (vim_visual && vim_pending == 'i' && lo == 'b') { vim_apply_block_object('(', ')', 0); vim_pending = 0; }
+            else if (vim_visual && vim_pending == 'a' && lo == 'b') { vim_apply_block_object('(', ')', 1); vim_pending = 0; }
+            else if (vim_visual && vim_pending == 'i' && lo == 'B') { vim_apply_block_object('{', '}', 0); vim_pending = 0; }
+            else if (vim_visual && vim_pending == 'a' && lo == 'B') { vim_apply_block_object('{', '}', 1); vim_pending = 0; }
+            else if (vim_visual && lo == 'i') { vim_pending = 'i'; }
+            else if (vim_visual && lo == 'a') { vim_pending = 'a'; }
+            else if (vim_visual && (vim_pending == 'i' || vim_pending == 'a')) { vim_pending = 0; }   /* unsupported object (e.g. 'v' 'i' 'x'): swallow rather than leak into d/x/y below */
+
+            /* Visual mode: swap selection ends, case-change, or cut/yank the selection -- all leave Visual afterward except 'o', which stays in it. */
+            else if (vim_visual && lo == 'o') { vim_visual_swap_ends(); vim_pending = 0; vim_count = 0; }
+            else if (vim_visual && lo == '~') { vim_visual_case(0); vim_pending = 0; vim_count = 0; }
+            else if (vim_visual && lo == 'u') { vim_visual_case(1); vim_pending = 0; vim_count = 0; }
+            else if (vim_visual && lo == 'U') { vim_visual_case(2); vim_pending = 0; vim_count = 0; }
+            else if (vim_visual && (lo == 'd' || lo == 'x')) { vim_visual_operate('d'); vim_pending = 0; vim_count = 0; }
+            else if (vim_visual && lo == 'y') { vim_visual_operate('y'); vim_pending = 0; vim_count = 0; }
+
+            /* Normal-mode 3-key operator+object: diw/daw/yiw/yaw/ciw (word only -- see vim_pending2's declaration comment). */
+            else if (!vim_visual && vim_pending2 && (vim_pending == 'd' || vim_pending == 'y' || vim_pending == 'c') && lo == 'w') {
+                int start, end;
+                if (vim_pending2 == 'a') vim_a_word_bounds(&start, &end); else vim_word_object_bounds(&start, &end);
+                vim_select_object(start, end);
+                if (vim_pending == 'y') { cmd_copy(); sel_clear(); }
+                else { cmd_cut(); if (vim_pending == 'c') vim_insert = 1; }
+                vim_pending = 0; vim_pending2 = 0; vim_count = 0;
+            }
+            /* Normal-mode 2-key: dd/yy/cc, dw/yw, d$, and starting a 3-key operator+object sequence. */
+            else if (vim_pending == 'd' && lo == 'd') {
+                int n = vim_take_count(), r;
+                yank_lines(cur_line, n);
+                for (r = 0; r < n; r++) delete_current_line();
+                vim_pending = 0;
+            }
+            else if (vim_pending == 'y' && lo == 'y') {
+                yank_lines(cur_line, vim_take_count());
+                flash_status("Yanked.");
+                vim_pending = 0;
+            }
+            else if (vim_pending == 'c' && lo == 'c') { vim_change_line(); vim_pending = 0; vim_count = 0; }
+            else if (vim_pending == 'd' && lo == 'w') {
+                int start, end;
+                vim_word_motion_bounds(&start, &end);
+                vim_select_object(start, end);
+                cmd_cut();
+                vim_pending = 0; vim_count = 0;
+            }
+            else if (vim_pending == 'y' && lo == 'w') {
+                int start, end;
+                vim_word_motion_bounds(&start, &end);
+                vim_select_object(start, end);
+                cmd_copy();
+                sel_clear();
+                vim_pending = 0; vim_count = 0;
+            }
+            else if (vim_pending == 'd' && lo == '$') { vim_delete_to_eol(); vim_pending = 0; vim_count = 0; }
+            else if (!vim_visual && (vim_pending == 'd' || vim_pending == 'y' || vim_pending == 'c') && (lo == 'i' || lo == 'a')) { vim_pending2 = lo; }
+            /* cw/ce: real vim's well-known special case, cw behaves like ce (see vim_change_word()'s comment) -- checked here, before the plain w/e motions further down, so an active 'c' pending takes priority over them. */
+            else if (vim_pending == 'c' && (lo == 'w' || lo == 'e')) { vim_change_word(); vim_pending = 0; vim_count = 0; }
+            /* Any other d/y/c combo isn't supported -- swallow it safely rather than letting the stale pending leak into an unrelated bare-letter command below (e.g. a stray 'p' after an unfinished 'd' must not paste). */
+            else if (vim_pending == 'd' || vim_pending == 'y' || vim_pending == 'c') { vim_pending = 0; vim_pending2 = 0; vim_count = 0; }
+
+            /* g-prefix: gg (with count), g_, gJ, ge, gE. gj/gk (move by visual/wrapped row) are not implemented -- left for a follow-up, since they need wrap-row-aware movement rather than a simple line step. */
+            else if (vim_pending == 'g' && lo == 'g') { do_move(vim_move_gg); vim_pending = 0; }
+            else if (vim_pending == 'g' && lo == '_') { do_move(vim_last_nonblank); vim_pending = 0; vim_count = 0; }
+            else if (vim_pending == 'g' && lo == 'J') { vim_gjoin(); vim_pending = 0; vim_count = 0; }
+            else if (vim_pending == 'g' && lo == 'e') { int n = vim_take_count(), r; for (r = 0; r < n; r++) do_move(vim_word_end_back); vim_pending = 0; }
+            else if (vim_pending == 'g' && lo == 'E') { int n = vim_take_count(), r; for (r = 0; r < n; r++) do_move(vim_WORD_end_back); vim_pending = 0; }
+            else if (vim_pending == 'g') { vim_pending = 0; vim_count = 0; }   /* unsupported g-combo (e.g. gj/gk): swallow rather than leak */
+
+            /* z-prefix: zz/zt/zb reposition the viewport without moving the cursor -- called directly, same reasoning as Ctrl+e/y above. */
+            else if (vim_pending == 'z' && lo == 'z') { vim_scroll_center(); request_full_redraw(); vim_pending = 0; }
+            else if (vim_pending == 'z' && lo == 't') { vim_scroll_top();    request_full_redraw(); vim_pending = 0; }
+            else if (vim_pending == 'z' && lo == 'b') { vim_scroll_bottom(); request_full_redraw(); vim_pending = 0; }
+            else if (vim_pending == 'z') { vim_pending = 0; }   /* unsupported z-combo: swallow rather than leak */
+
+            /* Plain motions. */
+            else if (lo == 'h') { int n = vim_take_count(), r; for (r = 0; r < n; r++) do_move(move_left);        vim_pending = 0; }
+            else if (lo == 'l') { int n = vim_take_count(), r; for (r = 0; r < n; r++) do_move(move_right);       vim_pending = 0; }
+            else if (lo == 'k') { int n = vim_take_count(), r; for (r = 0; r < n; r++) do_move(move_up);          vim_pending = 0; }
+            else if (lo == 'j') { int n = vim_take_count(), r; for (r = 0; r < n; r++) do_move(move_down);        vim_pending = 0; }
+            else if (lo == 'w') { int n = vim_take_count(), r; for (r = 0; r < n; r++) do_move(vim_word_forward); vim_pending = 0; }
+            else if (lo == 'b') { int n = vim_take_count(), r; for (r = 0; r < n; r++) do_move(vim_word_back);    vim_pending = 0; }
+            else if (lo == 'e') { int n = vim_take_count(), r; for (r = 0; r < n; r++) do_move(vim_word_end);     vim_pending = 0; }
+            else if (lo == 'W') { int n = vim_take_count(), r; for (r = 0; r < n; r++) do_move(vim_WORD_forward); vim_pending = 0; }
+            else if (lo == 'B') { int n = vim_take_count(), r; for (r = 0; r < n; r++) do_move(vim_WORD_back);    vim_pending = 0; }
+            else if (lo == 'E') { int n = vim_take_count(), r; for (r = 0; r < n; r++) do_move(vim_WORD_end);     vim_pending = 0; }
+            else if (lo == '0') { do_move(move_home);          vim_pending = 0; vim_count = 0; }
+            else if (lo == '$') { do_move(move_end);           vim_pending = 0; vim_count = 0; }
+            else if (lo == '^') { do_move(vim_first_nonblank); vim_pending = 0; vim_count = 0; }
+            else if (lo == 'G') { do_move(vim_move_G);         vim_pending = 0; }
+            else if (lo == '%') { do_move(vim_match_pair);     vim_pending = 0; vim_count = 0; }
+            else if (lo == '{') { do_move(vim_paragraph_back);    vim_pending = 0; vim_count = 0; }
+            else if (lo == '}') { do_move(vim_paragraph_forward); vim_pending = 0; vim_count = 0; }
+            else if (lo == 'H') { do_move(vim_move_screen_top);    vim_pending = 0; vim_count = 0; }
+            else if (lo == 'M') { do_move(vim_move_screen_middle); vim_pending = 0; vim_count = 0; }
+            else if (lo == 'L') { do_move(vim_move_screen_bottom); vim_pending = 0; vim_count = 0; }
+            else if (lo == ';') { if (vim_last_find_cmd) do_move(vim_apply_find);         vim_pending = 0; vim_count = 0; }
+            else if (lo == ',') { if (vim_last_find_cmd) do_move(vim_apply_find_reverse); vim_pending = 0; vim_count = 0; }
+
+            else if (lo == 'x') {
+                int n = vim_take_count(), r;
+                vim_delete_chars_yank(n);
+                for (r = 0; r < n; r++) do_delete_forward();
+                vim_pending = 0;
+            }
+            else if (lo == 'u') { do_undo(); vim_pending = 0; vim_count = 0; }
+            else if (lo == 'U') { do_undo(); vim_pending = 0; vim_count = 0; }   /* see vim_change_line()'s neighboring comments: single-level undo makes U and u equivalent here */
+            else if (lo == 'p') { vim_put(1); vim_pending = 0; vim_count = 0; }
+            else if (lo == 'P') { vim_put(0); vim_pending = 0; vim_count = 0; }
+            else if (lo == 'J') { vim_join(); vim_pending = 0; vim_count = 0; }
+
+            else if (lo == 'i' && !vim_visual) { vim_insert = 1;   vim_pending = 0; vim_count = 0; request_full_redraw(); }
+            else if (lo == 'a' && !vim_visual) { do_move(move_right); vim_insert = 1; vim_pending = 0; vim_count = 0; request_full_redraw(); }
+            else if (lo == 'I' && !vim_visual) { do_move(vim_first_nonblank); vim_insert = 1; vim_pending = 0; vim_count = 0; request_full_redraw(); }
+            else if (lo == 'A' && !vim_visual) { do_move(move_end);          vim_insert = 1; vim_pending = 0; vim_count = 0; request_full_redraw(); }
+            else if (lo == 'o' && !vim_visual) { do_move(move_end); do_split_line(); vim_insert = 1; vim_pending = 0; vim_count = 0; request_full_redraw(); }
+            else if (lo == 'O' && !vim_visual) { vim_open_above(); vim_insert = 1; vim_pending = 0; vim_count = 0; request_full_redraw(); }
+
+            else if (lo == 'r' && !vim_visual) { vim_pending = 'r'; }
+            else if (lo == 'R' && !vim_visual) { vim_insert = 1; vim_replace = 1; vim_pending = 0; vim_count = 0; request_full_redraw(); }
+            else if (lo == 's' && !vim_visual) {
+                int n = vim_take_count(), r;
+                vim_delete_chars_yank(n);
+                for (r = 0; r < n; r++) do_delete_forward();
+                vim_insert = 1;
+                vim_pending = 0;
+                request_full_redraw();
+            }
+            else if (lo == 'S' && !vim_visual) { vim_change_line(); vim_pending = 0; vim_count = 0; }
+            else if (lo == 'C' && !vim_visual) { vim_change_to_eol(); vim_pending = 0; vim_count = 0; }
+            else if (lo == 'D' && !vim_visual) { vim_delete_to_eol(); vim_pending = 0; vim_count = 0; }
+
+            else if (lo == 'f') { vim_pending = 'f'; }
+            else if (lo == 'F') { vim_pending = 'F'; }
+            else if (lo == 't') { vim_pending = 't'; }
+            else if (lo == 'T') { vim_pending = 'T'; }
             else if (lo == 'd') { vim_pending = 'd'; }
-            else if (lo == ':') { vim_command_line(); vim_pending = 0; request_full_redraw(); }
-            else vim_pending = 0;   /* unrecognized: swallow, don't insert -- no screen change */
+            else if (lo == 'y') { vim_pending = 'y'; }
+            else if (lo == 'c' && !vim_visual) { vim_pending = 'c'; }
+            else if (lo == 'g') { vim_pending = 'g'; }
+            else if (lo == 'z') { vim_pending = 'z'; }
+
+            else if (lo == ':') { vim_command_line(); vim_pending = 0; vim_count = 0; request_full_redraw(); }
+            else { vim_pending = 0; vim_pending2 = 0; vim_count = 0; }   /* unrecognized: swallow, don't insert -- no screen change */
         }
         else if (lo == 27) {
             /* Esc no longer quits (see Alt+X below); it now only clears an active selection, or in vim mode drops back from Insert to Normal, otherwise it's a no-op. */
@@ -2392,7 +3473,7 @@ int main(int argc, char **argv)
                 sel_clear();
                 request_full_redraw();
             } else if (vim_mode && vim_insert) {
-                vim_insert = 0; vim_pending = 0;  /* Insert -> Normal */
+                vim_insert = 0; vim_replace = 0; vim_pending = 0;  /* Insert/Replace -> Normal */
                 request_full_redraw();
             }
         } else if (lo == 0) {
@@ -2432,7 +3513,11 @@ int main(int argc, char **argv)
                 }
             }
         } else if (lo == 13) do_split_line();
+        else if (lo == 10) do_split_line();   /* Ctrl+J: alias for Enter, insert-mode line break */
         else if (lo == 8)  do_backspace();
+        else if (lo == 23) do_delete_word_back();   /* Ctrl+W: delete word before cursor */
+        else if (lo == 20) do_list_indent(1);       /* Ctrl+T: indent current line */
+        else if (lo == 4)  do_list_indent(-1);      /* Ctrl+D: de-indent current line (vim Normal sub-mode claims this code for half-page-down instead, above) */
         else if (lo == 1)  cmd_save_as();
         else if (lo == 6)  cmd_find();
         else if (lo == 7)  cmd_goto();
@@ -2445,7 +3530,7 @@ int main(int argc, char **argv)
         else if (lo == 22) cmd_paste();
         else if (lo == 26) do_undo();
         else if (lo == 9)  do_list_indent(1);
-        else if (lo >= 32 && lo < 127) do_insert_char(lo);
+        else if (lo >= 32 && lo < 127) { if (vim_mode && vim_replace) do_replace_char(lo); else do_insert_char(lo); }
 
         if (want_quit) break;
     }
