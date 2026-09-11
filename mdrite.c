@@ -27,7 +27,7 @@
 #define MAX_LINE_LEN  1024
 #define MAX_LINES     2000
 
-/* Max word-wrapped visual rows a single buffer line can occupy in Writer view. Used by Line's wrap cache below. */
+/* Max word-wrapped visual rows a single buffer line can occupy in Rich view. Used by Line's wrap cache below. */
 #define MAX_WRAP_ROWS 16
 
 /* Sublist indent step in spaces, and max nesting depth. do_list_indent() moves indentation by LIST_INDENT_UNIT at a time; MAX_LIST_INDENT caps it so indentation can't eat into a wrapped line's usable width. */
@@ -74,7 +74,7 @@ void do_list_indent(int dir);
 typedef struct {
     char text[MAX_LINE_LEN + 1];
     int  len;
-    /* Cached Writer-view word-wrap offsets for this line. Wrap only depends on the line's own text, so it's safe to compute once and reuse until the line is edited (wrap_dirty tracks that). */
+    /* Cached Rich-view word-wrap offsets for this line. Wrap only depends on the line's own text, so it's safe to compute once and reuse until the line is edited (wrap_dirty tracks that). */
     int  wrap_starts[MAX_WRAP_ROWS];
     int  wrap_nstarts;
     int  wrap_dirty;
@@ -90,7 +90,7 @@ int code_state_valid = 0;
 int  cur_line = 0, cur_col = 0;
 int  top_line = 0;
 int  left_col = 0;
-/* Horizontal scroll offset for code-fence lines in Writer view, independent
+/* Horizontal scroll offset for code-fence lines in Rich view, independent
    of left_col (which only applies to Raw Markdown view). Recomputed the same
    way left_col is -- clamped to keep cur_col on screen -- but only while
    cur_line is inside a fence; leaving code resets it to 0 so an untouched
@@ -748,8 +748,8 @@ void delete_current_line(void)
     code_state_valid = 0;
 }
 
-/* Maps a raw buffer column to its Writer-view screen column, mirroring render_line's hiding logic so cursor placement and rendering stay in sync. A [link](url) collapses entirely to one screen column. For one-off column queries only -- use build_screen_col_table() for many columns of the same line. */
-/* Scans a possibly-indented list line's marker (leading spaces, then '- '), returning the indent depth or -1 if it isn't a list line. Shared by writer_screen_col, build_screen_col_table, render_writer_line, and do_list_indent() so they all agree on where content starts. */
+/* Maps a raw buffer column to its Rich-view screen column, mirroring render_line's hiding logic so cursor placement and rendering stay in sync. A [link](url) collapses entirely to one screen column. For one-off column queries only -- use build_screen_col_table() for many columns of the same line. */
+/* Scans a possibly-indented list line's marker (leading spaces, then '- '), returning the indent depth or -1 if it isn't a list line. Shared by rich_screen_col, build_screen_col_table, render_rich_line, and do_list_indent() so they all agree on where content starts. */
 /* Scans a possibly-indented list line's marker -- leading spaces, then either
    an unordered marker ("- ", "+ ", or "* ", all treated as the same bullet)
    or an ordered marker (one or more digits, capped at 9 per CommonMark,
@@ -792,7 +792,7 @@ int list_indent_of(const char *text, int len)
     return list_marker_of(text, len, NULL, NULL);
 }
 
-int writer_screen_col(const char *text, int raw_col, int in_code)
+int rich_screen_col(const char *text, int raw_col, int in_code)
 {
     int i = 0, col = 0, len = (int) strlen(text);
 
@@ -825,7 +825,7 @@ int writer_screen_col(const char *text, int raw_col, int in_code)
         /* Ordered markers aren't hidden (see build_screen_col_table's comment),
            so only an unordered bullet collapses here -- and it now collapses to
            two columns (glyph + its trailing space), not one, to match how
-           render_writer_line actually draws it. */
+           render_rich_line actually draws it. */
         if (indent >= 0 && !ordered) {
             if (raw_col <= indent) return raw_col;
             if (raw_col < indent + marker_len) return indent;
@@ -859,7 +859,7 @@ int writer_screen_col(const char *text, int raw_col, int in_code)
     return col;
 }
 
-/* Builds, in one O(len) pass, a table mapping every raw column to its Writer-view screen column -- the same rules as writer_screen_col but computed once instead of per query. `table` needs len+1 ints and is meant as transient scratch, not stored per line. Fixes the old O(len^2) wrap computation. */
+/* Builds, in one O(len) pass, a table mapping every raw column to its Rich-view screen column -- the same rules as rich_screen_col but computed once instead of per query. `table` needs len+1 ints and is meant as transient scratch, not stored per line. Fixes the old O(len^2) wrap computation. */
 int build_screen_col_table(const char *text, int *table, int in_code)
 {
     int len = (int) strlen(text);
@@ -903,7 +903,7 @@ int build_screen_col_table(const char *text, int *table, int in_code)
            bullet, there's nothing to hide, so leave the identity mapping the
            loop below already produces for ordinary text in place. An
            unordered bullet still collapses, but now to two columns (glyph +
-           its trailing space) to match render_writer_line. */
+           its trailing space) to match render_rich_line. */
         if (indent >= 0 && !ordered) {
             int k;
             for (k = 1; k <= indent; k++) table[k] = k;
@@ -931,7 +931,7 @@ int build_screen_col_table(const char *text, int *table, int in_code)
                 int k = j + 2, m;
                 while (k < len && text[k] != ')') k++;
                 if (k < len) {
-                    /* Raw columns from '[' through the closing ')' all collapse to the pre-link column, mirroring writer_screen_col's early-out. */
+                    /* Raw columns from '[' through the closing ')' all collapse to the pre-link column, mirroring rich_screen_col's early-out. */
                     for (m = i_start + 1; m <= k; m++) table[m] = col;
                     col += (j - (i_start + 1));   /* label length */
                     i = k + 1;
@@ -956,35 +956,35 @@ int build_screen_col_table(const char *text, int *table, int in_code)
     return len;
 }
 
-/* Right-arrow step for Writer view: skips a whole hidden run (heading prefix, list bullet, or a markup delimiter pair) in one keypress, built on writer_screen_col so it covers every hidden-markup case that function does. */
-int writer_move_right(const char *text, int raw_col, int in_code)
+/* Right-arrow step for Rich view: skips a whole hidden run (heading prefix, list bullet, or a markup delimiter pair) in one keypress, built on rich_screen_col so it covers every hidden-markup case that function does. */
+int rich_move_right(const char *text, int raw_col, int in_code)
 {
     int len = (int) strlen(text);
     int start_screen, new_col;
     if (in_code) return raw_col + 1;
-    start_screen = writer_screen_col(text, raw_col, 0);
+    start_screen = rich_screen_col(text, raw_col, 0);
     new_col = raw_col + 1;
-    while (new_col < len && writer_screen_col(text, new_col, 0) == start_screen) new_col++;
+    while (new_col < len && rich_screen_col(text, new_col, 0) == start_screen) new_col++;
     return new_col;
 }
 
-/* Left-arrow step for Writer view: mirror image of writer_move_right, its exact inverse. */
-int writer_move_left(const char *text, int raw_col, int in_code)
+/* Left-arrow step for Rich view: mirror image of rich_move_right, its exact inverse. */
+int rich_move_left(const char *text, int raw_col, int in_code)
 {
     int target_screen, new_col;
     if (in_code) return raw_col - 1;
-    target_screen = writer_screen_col(text, raw_col - 1, 0);
+    target_screen = rich_screen_col(text, raw_col - 1, 0);
     new_col = raw_col - 1;
-    while (new_col > 0 && writer_screen_col(text, new_col - 1, 0) == target_screen) new_col--;
+    while (new_col > 0 && rich_screen_col(text, new_col - 1, 0) == target_screen) new_col--;
     return new_col;
 }
 
-/* ================= word wrap (Writer view only) ================= */
+/* ================= word wrap (Rich view only) ================= */
 
 /* Scratch buffer for build_screen_col_table(), reused across calls instead of a stack array each time, since DOS stack space is precious. */
 static int g_col_table[MAX_LINE_LEN + 1];
 
-/* Raw-column offsets where each wrapped visual row of `text` begins in Writer view. Prefers breaking at the most recent space for real word-wrap; a run with no space hard-breaks at the column limit. Screen columns are computed once via build_screen_col_table() rather than per candidate column. Most callers should use get_line_wraps() below instead, which caches per line. */
+/* Raw-column offsets where each wrapped visual row of `text` begins in Rich view. Prefers breaking at the most recent space for real word-wrap; a run with no space hard-breaks at the column limit. Screen columns are computed once via build_screen_col_table() rather than per candidate column. Most callers should use get_line_wraps() below instead, which caches per line. */
 int compute_wrap_starts(const char *text, int *starts, int in_code)
 {
     int len = (int) strlen(text);
@@ -1067,7 +1067,7 @@ int wrap_seg_of_col(int *starts, int nstarts, int col)
     return 0;
 }
 
-/* The raw column whose Writer-view screen column is closest to target_col without exceeding it -- keeps the cursor's screen column stable when Up/Down crosses a wrapped row. Builds the line's screen-column table once instead of scanning per candidate column. */
+/* The raw column whose Rich-view screen column is closest to target_col without exceeding it -- keeps the cursor's screen column stable when Up/Down crosses a wrapped row. Builds the line's screen-column table once instead of scanning per candidate column. */
 int col_for_target_screen(const char *text, int lo, int hi, int target_col, int in_code)
 {
     int base, best = lo, c;
@@ -1087,7 +1087,7 @@ void move_left(void)
 {
     if (cur_col > 0) {
         ensure_code_state();
-        cur_col = (view_mode == 0) ? writer_move_left(doc[cur_line]->text, cur_col, line_in_code(cur_line))
+        cur_col = (view_mode == 0) ? rich_move_left(doc[cur_line]->text, cur_col, line_in_code(cur_line))
                                     : cur_col - 1;
     } else if (cur_line > 0) {
         cur_line--;
@@ -1098,14 +1098,14 @@ void move_right(void)
 {
     if (cur_col < doc[cur_line]->len) {
         ensure_code_state();
-        cur_col = (view_mode == 0) ? writer_move_right(doc[cur_line]->text, cur_col, line_in_code(cur_line))
+        cur_col = (view_mode == 0) ? rich_move_right(doc[cur_line]->text, cur_col, line_in_code(cur_line))
                                     : cur_col + 1;
     } else if (cur_line < doc_count - 1) {
         cur_line++;
         cur_col = 0;
     }
 }
-/* Up/Down in Writer view step by visual row, not buffer line, moving between wrap segments before crossing into the next buffer line. Raw Markdown view keeps the old one-line-per-row behavior. */
+/* Up/Down in Rich view step by visual row, not buffer line, moving between wrap segments before crossing into the next buffer line. Raw Markdown view keeps the old one-line-per-row behavior. */
 void move_up(void)
 {
     int starts[MAX_WRAP_ROWS], n, seg, target, in_code;
@@ -1120,8 +1120,8 @@ void move_up(void)
     in_code = line_in_code(cur_line);
     n = get_line_wraps(cur_line, starts);
     seg = wrap_seg_of_col(starts, n, cur_col);
-    target = writer_screen_col(doc[cur_line]->text, cur_col, in_code)
-           - writer_screen_col(doc[cur_line]->text, starts[seg], in_code);
+    target = rich_screen_col(doc[cur_line]->text, cur_col, in_code)
+           - rich_screen_col(doc[cur_line]->text, starts[seg], in_code);
     if (seg > 0) {
         cur_col = col_for_target_screen(doc[cur_line]->text, starts[seg - 1],
                                           starts[seg] - 1, target, in_code);
@@ -1148,8 +1148,8 @@ void move_down(void)
     in_code = line_in_code(cur_line);
     n = get_line_wraps(cur_line, starts);
     seg = wrap_seg_of_col(starts, n, cur_col);
-    target = writer_screen_col(doc[cur_line]->text, cur_col, in_code)
-           - writer_screen_col(doc[cur_line]->text, starts[seg], in_code);
+    target = rich_screen_col(doc[cur_line]->text, cur_col, in_code)
+           - rich_screen_col(doc[cur_line]->text, starts[seg], in_code);
     if (seg + 1 < n) {
         int seg_end = (seg + 2 < n) ? starts[seg + 2] - 1 : doc[cur_line]->len;
         cur_col = col_for_target_screen(doc[cur_line]->text, starts[seg + 1], seg_end, target, in_code);
@@ -1263,7 +1263,7 @@ void scroll_to_cursor(void)
 
 /* The horizontal-scroll value relevant to line_no's current rendering:
    left_col in Raw view (applies to the whole document), code_left_col for a
-   code line in Writer view. Wrapped prose lines don't scroll at all, so 0
+   code line in Rich view. Wrapped prose lines don't scroll at all, so 0
    is fine there -- it's never compared against once view_mode==0 and
    line_in_code() is false. Callers must have called ensure_code_state()
    first (line_rows()/get_line_wraps() already do, so it's safe right after
@@ -1288,7 +1288,7 @@ void redraw_after_char_edit(int line_no, int old_nrows, int old_top, int old_lef
     if (new_nrows != old_nrows) { request_full_redraw(); return; }
 
     /* old_left is left_col in Raw view or code_left_col for a code line in
-       Writer view (whichever the caller captured, via active_left_col()) --
+       Rich view (whichever the caller captured, via active_left_col()) --
        wrapped prose lines don't scroll at all, so nothing to check there. */
     if (view_mode == 1 || line_in_code(line_no)) {
         int new_left = old_left;
@@ -1497,7 +1497,7 @@ unsigned char apply_sel(unsigned char attr, int raw_col, int sel_start, int sel_
     return sel_overlaps(raw_col, raw_col + 1, sel_start, sel_end) ? swap_attr(attr) : attr;
 }
 
-/* Renders one buffer line into one screen row. Raw view shows text as typed with horizontal scroll; Writer view is a single-pass scanner checking whole-line markers (heading/quote/list/HR) first, then toggling inline styles left to right. sel_start/sel_end give the row's selected raw range, from sel_line_range(). */
+/* Renders one buffer line into one screen row. Raw view shows text as typed with horizontal scroll; Rich view is a single-pass scanner checking whole-line markers (heading/quote/list/HR) first, then toggling inline styles left to right. sel_start/sel_end give the row's selected raw range, from sel_line_range(). */
 /* Raw Markdown view: one buffer line per screen row, unwrapped, scrolled by `offset`. Writes each cell exactly once through row_ptr(), instead of the old clear-then-overwrite which touched covered cells twice. */
 void render_line(const char *text, int row, int offset, int sel_start, int sel_end)
 {
@@ -1509,8 +1509,8 @@ void render_line(const char *text, int row, int offset, int sel_start, int sel_e
     for (; col < SCREEN_COLS; col++) rp[col] = CELL(' ', ATTR_NORMAL);
 }
 
-/* Writer view: draws one visual row -- the word-wrapped slice [seg_start, seg_end) compute_wrap_starts chose, which already fits within SCREEN_COLS at a word boundary. For a continuation row, inline style state is recovered by silently replaying the scanner up to seg_start without drawing anything. */
-void render_writer_line(const char *text, int row, int seg_start, int seg_end,
+/* Rich view: draws one visual row -- the word-wrapped slice [seg_start, seg_end) compute_wrap_starts chose, which already fits within SCREEN_COLS at a word boundary. For a continuation row, inline style state is recovered by silently replaying the scanner up to seg_start without drawing anything. */
+void render_rich_line(const char *text, int row, int seg_start, int seg_end,
                          int sel_start, int sel_end, int in_code)
 {
     unsigned int far *rp = row_ptr(row);
@@ -1806,8 +1806,8 @@ void draw_bottom_and_cursor(void)
             screen_row = rows + seg;
             {
                 int seg_ref = in_code ? code_left_col : starts[seg];
-                screen_col = writer_screen_col(doc[cur_line]->text, cur_col, in_code)
-                           - writer_screen_col(doc[cur_line]->text, seg_ref, in_code);
+                screen_col = rich_screen_col(doc[cur_line]->text, cur_col, in_code)
+                           - rich_screen_col(doc[cur_line]->text, seg_ref, in_code);
             }
         }
         if (screen_col < 0) screen_col = 0;
@@ -1843,7 +1843,7 @@ void redraw_line_only(int line_no)
             {
                 int seg_start = in_code ? code_left_col : starts[seg];
                 int seg_end = (seg + 1 < n) ? starts[seg + 1] : doc[line_no]->len;
-                render_writer_line(doc[line_no]->text, r, seg_start, seg_end, sel_start, sel_end, in_code);
+                render_rich_line(doc[line_no]->text, r, seg_start, seg_end, sel_start, sel_end, in_code);
             }
         }
     }
@@ -1871,7 +1871,7 @@ void redraw_screen(void)
             }
         }
     } else {
-        /* Writer view: each buffer line may span several wrapped visual rows, so walk from top_line drawing every wrap segment until the screen fills. */
+        /* Rich view: each buffer line may span several wrapped visual rows, so walk from top_line drawing every wrap segment until the screen fills. */
         left_col = 0;
         ensure_code_state();
         /* Code lines horizontal-scroll uniformly (same precedent as left_col
@@ -1899,7 +1899,7 @@ void redraw_screen(void)
                 for (seg = 0; seg < n && r < TEXT_ROWS; seg++, r++) {
                     int seg_start = in_code ? code_left_col : starts[seg];
                     int seg_end = (seg + 1 < n) ? starts[seg + 1] : doc[ln]->len;
-                    render_writer_line(doc[ln]->text, r, seg_start, seg_end, sel_start, sel_end, in_code);
+                    render_rich_line(doc[ln]->text, r, seg_start, seg_end, sel_start, sel_end, in_code);
                 }
             }
             ln++;

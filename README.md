@@ -43,7 +43,7 @@ mdrite.exe [filename]
     there is one, same as everywhere else; plain typing does NOT
     yet replace a selection the same way -- worth knowing until
     that's unified. One clipboard slot, no history.
-- **F2** Toggle Writer view / raw Markdown view
+- **F2** Toggle Rich view / raw Markdown view
 - **F4** Toggle vim-lite keymapping on/off (also under View)
 - **Alt+X** Quit (confirms if there are unsaved changes) -- moved
   here from Esc to match the WordStar/early-DOS-editor convention
@@ -98,7 +98,7 @@ mdrite.exe [filename]
   if there is one; otherwise it's a no-op now that quitting has its
   own key (Alt+X).
 
-## Supported Markdown (Writer view)
+## Supported Markdown (Rich view)
 
 - `**bold**`  `*italic*`  `` `code` ``  `~~strikethrough~~`
 - `#` / `##` / `###` heading (background-highlighted, one style for
