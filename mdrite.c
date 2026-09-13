@@ -126,6 +126,8 @@ int vim_mode = 0;
 int vim_insert = 0;    /* 0 = Normal sub-mode, 1 = Insert sub-mode */
 int vim_pending = 0;   /* holds the first key of a two-key command, e.g. 'd' of dd */
 int vim_visual = 0;    /* 0 = not in Visual, 1 = charwise (v), 2 = linewise (V) */
+/* Cap for vim_count below -- int is 16-bit here, well under this times 10 plus a digit. */
+#define VIM_COUNT_MAX 9999
 int vim_count = 0;     /* pending repeat count typed before a motion/operator, e.g. the 3 of 3dd; 0 means "none given", so commands default to 1 */
 /* 1 when the clipboard holds a whole-line yank/delete (from yy/dd/Visual
    Line), so p/P insert it as new line(s) below/above the cursor instead of
@@ -398,6 +400,7 @@ void doc_reset(void)
     cur_line = cur_col = top_line = left_col = code_left_col = 0;
     modified = 0;
     undo_line_no = -1;
+    redo_line_no = -1;
     sel_clear();
     code_state_valid = 0;
 }
@@ -521,7 +524,7 @@ int sel_delete(void)
         Line *endl = doc[el];
         int suffix_len = endl->len - ec;
         int shift;
-        if (startl->len + suffix_len > MAX_LINE_LEN) {
+        if (sc + suffix_len > MAX_LINE_LEN) {
             flash_error("Selection too long to delete across lines.");
             sel_clear();
             return 0;
@@ -672,7 +675,8 @@ int split_line(void)
 void do_split_line(void)
 {
     Line *l = doc[cur_line];
-    int indent = -1, marker_len = 0, ordered = 0, marker_num = 0;
+    int indent = -1, marker_len = 0, ordered = 0;
+    long marker_num = 0;
     char punct = '-';
     int had_split_col = cur_col;
 
@@ -685,7 +689,7 @@ void do_split_line(void)
                ordered item, or just the bullet character itself otherwise. */
             if (ordered) {
                 punct = l->text[indent + marker_len - 2];
-                marker_num = atoi(l->text + indent);
+                marker_num = atol(l->text + indent);
             } else {
                 punct = l->text[indent];
             }
@@ -700,7 +704,7 @@ void do_split_line(void)
         int new_marker_len;
         if (ordered) {
             /* Continuing an ordered item renumbers it, same as a real editor. */
-            sprintf(marker_buf, "%d%c ", marker_num + 1, punct);
+            sprintf(marker_buf, "%ld%c ", marker_num + 1, punct);
         } else {
             /* Continuing an unordered item repeats whichever bullet character
                (-, +, or *) the item already used. */
@@ -727,6 +731,8 @@ void delete_current_line(void)
 {
     sel_clear();
     if (doc_count <= 1) {
+        if (doc[0]->len == 0) return;   /* nothing to delete */
+        save_undo(0);
         doc[0]->text[0] = '\0';
         doc[0]->len = 0;
         line_mark_dirty(doc[0]);
@@ -1723,7 +1729,7 @@ void draw_status_bar(void)
             status_msg);
     put_string(col, STATUS_ROW, left, attr);
 
-    percent = (doc_count > 1) ? ((cur_line * 100) / (doc_count - 1)) : 100;
+    percent = (doc_count > 1) ? (int) (((long) cur_line * 100) / (doc_count - 1)) : 100;
     sprintf(right, "%s  %3d%%  %d:%d",
             view_mode ? "Markdown" : "Rich",
             percent, cur_line + 1, cur_col + 1);
@@ -1977,10 +1983,16 @@ int read_full_line(FILE *f, char **out, int *out_len)
 
 void load_file(const char *fname)
 {
-    FILE *f = fopen(fname, "r");
+    FILE *f;
     int i;
     char *raw;
     int raw_len;
+    /* filename[] is a fixed 80 bytes. argv[1] from main() isn't length-checked like prompt_input()'s callers are, so check here too. */
+    if (strlen(fname) >= sizeof(filename)) {
+        flash_error("Filename too long.");
+        return;
+    }
+    f = fopen(fname, "r");
     if (!f) { flash_error("Could not open file."); return; }
     for (i = 0; i < doc_count; i++) free(doc[i]);
     doc_count = 0;
@@ -2010,6 +2022,7 @@ void load_file(const char *fname)
     cur_line = cur_col = top_line = left_col = code_left_col = 0;
     modified = 0;
     undo_line_no = -1;
+    redo_line_no = -1;
     sel_clear();
     code_state_valid = 0;
     request_full_redraw();
@@ -2031,12 +2044,26 @@ void save_file(const char *fname)
 /* ================= commands ================= */
 
 /* Copies the selection into the clipboard buffer, lines joined with '\n'. Doesn't touch the document or clear the selection -- Copy is read-only, unlike Cut. */
-void cmd_copy(void)
+int cmd_copy(void)
 {
     int sl, sc, el, ec, ln, from, to, n;
-    if (!sel_active) { flash_status_for("Nothing selected.", FLASH_SECS(2)); return; }
+    long total = 0;
+    if (!sel_active) { flash_status_for("Nothing selected.", FLASH_SECS(2)); return 0; }
     sel_bounds(&sl, &sc, &el, &ec);
-    if (sl == el && sc == ec) { flash_status_for("Nothing selected.", FLASH_SECS(2)); return; }
+    if (sl == el && sc == ec) { flash_status_for("Nothing selected.", FLASH_SECS(2)); return 0; }
+
+    for (ln = sl; ln <= el; ln++) {
+        from = (ln == sl) ? sc : 0;
+        to   = (ln == el) ? ec : doc[ln]->len;
+        if (from > doc[ln]->len) from = doc[ln]->len;
+        if (to   > doc[ln]->len) to   = doc[ln]->len;
+        if (to > from) total += to - from;
+        if (ln < el) total++;   /* joining newline */
+    }
+    if (total > CLIP_MAX - 1) {
+        flash_error("Selection too big to copy.");
+        return 0;
+    }
 
     vim_yank_linewise = 0;   /* a charwise selection copy always overwrites a prior linewise register */
     clip_len = 0;
@@ -2046,20 +2073,21 @@ void cmd_copy(void)
         if (from > doc[ln]->len) from = doc[ln]->len;
         if (to   > doc[ln]->len) to   = doc[ln]->len;
         n = to - from;
-        if (n > 0 && clip_len + n < CLIP_MAX - 1) {
+        if (n > 0) {
             memcpy(clipboard + clip_len, doc[ln]->text + from, n);
             clip_len += n;
         }
-        if (ln < el && clip_len < CLIP_MAX - 1) clipboard[clip_len++] = '\n';
+        if (ln < el) clipboard[clip_len++] = '\n';
     }
     clipboard[clip_len] = '\0';
     flash_status("Copied.");
+    return 1;
 }
 
 void cmd_cut(void)
 {
     if (!sel_active) { flash_status_for("Nothing selected.", FLASH_SECS(2)); return; }
-    cmd_copy();
+    if (!cmd_copy()) return;   /* leaves cmd_copy's own error in place, selection untouched */
     /* Only claims 'Cut.' if sel_delete actually removed something; otherwise it leaves sel_delete's own explanatory status_msg in place instead of overwriting it. */
     if (sel_delete()) flash_status("Cut.");
 }
@@ -2162,8 +2190,8 @@ int prompt_replace_choice(void)
 void cmd_replace(void)
 {
     char find_buf[80], repl_buf[80], msg[32];
-    int replace_all = 0, had_match = 0, count = 0;
-    long guard = 0;
+    int replace_all = 0, had_match = 0;
+    long guard = 0, count = 0;
     int rlen, i, ch = 0, truncated = 0;
     int sline, scol;
     int first_line = -1, first_col = -1;
@@ -2226,7 +2254,7 @@ void cmd_replace(void)
     if (truncated) {
         /* Leaves insert_char's own "Line full." message in place -- more actionable than a blanket success message. */
     } else if (count > 0) {
-        sprintf(msg, "Replaced %d.", count);
+        sprintf(msg, "Replaced %ld.", count);
         flash_status(msg);
     } else if (had_match) {
         flash_status("No replacements made.");
@@ -2239,12 +2267,12 @@ void cmd_replace(void)
 void cmd_goto(void)
 {
     char buf[16];
-    int n;
+    long n;
     if (!prompt_input("Go to line: ", buf, sizeof(buf)) || !buf[0]) return;
-    n = atoi(buf) - 1;
+    n = atol(buf) - 1;
     if (n < 0) n = 0;
     if (n >= doc_count) n = doc_count - 1;
-    cur_line = n;
+    cur_line = (int) n;
     cur_col = 0;
     request_full_redraw();
 }
@@ -2638,23 +2666,28 @@ void vim_apply_find_reverse(void)
 /* ---- vim line-wise yank/delete/put (yy, dd, p/P on a line-wise register) ---- */
 
 /* Copies up to `count` lines starting at line_no into the clipboard, one buffer line per '\n'-terminated chunk including a trailing '\n' after the last one -- that trailing newline is what marks the register line-wise for vim_put(). Used by both 'yy' (yank only) and 'dd' (yank-then-delete, same as real vim's cut-is-a-yank). */
-void yank_lines(int line_no, int count)
+int yank_lines(int line_no, int count)
 {
-    int i, n = count, take;
+    int i, n = count;
+    long total = 0;
     Line *l;
     if (n < 1) n = 1;
     if (line_no + n > doc_count) n = doc_count - line_no;
+    for (i = 0; i < n; i++) total += (long) doc[line_no + i]->len + 1;
+    if (total > CLIP_MAX - 1) {
+        flash_error("Too many lines to yank.");
+        return 0;
+    }
     clip_len = 0;
     for (i = 0; i < n; i++) {
         l = doc[line_no + i];
-        take = l->len;
-        if (clip_len + take + 1 >= CLIP_MAX) break;
-        memcpy(clipboard + clip_len, l->text, (size_t) take);
-        clip_len += take;
+        memcpy(clipboard + clip_len, l->text, (size_t) l->len);
+        clip_len += l->len;
         clipboard[clip_len++] = '\n';
     }
     clipboard[clip_len] = '\0';
     vim_yank_linewise = 1;
+    return 1;
 }
 
 /* Inserts the clipboard's line-wise register as whole new lines below (dir > 0) or above (dir <= 0) cur_line, for 'p'/'P' after a yy/dd/Visual-Line yank. Cursor lands at the start of the first inserted line, same as vim. */
@@ -2711,11 +2744,9 @@ void vim_visual_operate(int op)
     if (vim_visual == 2) {
         cur_line = sl;
         cur_col = 0;
-        yank_lines(sl, el - sl + 1);
-        if (op == 'y') {
-            flash_status("Yanked.");
-        } else {
-            for (i = 0; i <= el - sl; i++) delete_current_line();
+        if (yank_lines(sl, el - sl + 1)) {
+            if (op == 'y') flash_status("Yanked.");
+            else for (i = 0; i <= el - sl; i++) delete_current_line();
         }
     } else {
         if (op == 'y') cmd_copy();
@@ -2909,21 +2940,26 @@ void do_replace_char(int ch)
 void vim_join_lines(int with_space)
 {
     Line *l, *next;
-    int i, dest, cursor_at;
+    int i, dest, cursor_at, add_space, needed;
     if (cur_line >= doc_count - 1) return;
-    save_undo(cur_line);
     l = doc[cur_line];
     next = doc[cur_line + 1];
-    dest = l->len;
     i = 0;
+    add_space = 0;
     if (with_space) {
         while (i < next->len && (next->text[i] == ' ' || next->text[i] == '\t')) i++;
-        if (dest > 0 && l->text[dest - 1] != ' ' && i < next->len && dest < MAX_LINE_LEN) {
-            l->text[dest++] = ' ';
-        }
+        if (l->len > 0 && l->text[l->len - 1] != ' ' && i < next->len) add_space = 1;
     }
+    needed = l->len + add_space + (next->len - i);
+    if (needed > MAX_LINE_LEN) {
+        flash_error("Can't join: line too long.");
+        return;
+    }
+    save_undo(cur_line);
+    dest = l->len;
+    if (add_space) l->text[dest++] = ' ';
     cursor_at = dest;
-    while (i < next->len && dest < MAX_LINE_LEN) l->text[dest++] = next->text[i++];
+    while (i < next->len) l->text[dest++] = next->text[i++];
     l->text[dest] = '\0';
     l->len = dest;
     line_mark_dirty(l);
@@ -3005,19 +3041,20 @@ void vim_word_motion_bounds(int *start, int *end)
 }
 
 /* x, fixed to also yank the deleted character(s) into the clipboard (charwise), so a following 'p' composes into the classic "xp" transpose -- matches real vim, where x's target register isn't empty. */
-void vim_delete_chars_yank(int n)
+int vim_delete_chars_yank(int n)
 {
     Line *l = doc[cur_line];
-    int end_col = cur_col + n, take;
+    int end_col = cur_col + n, take, clip_take;
     if (end_col > l->len) end_col = l->len;
     take = end_col - cur_col;
     if (take > 0) {
-        if (take > CLIP_MAX - 1) take = CLIP_MAX - 1;
-        memcpy(clipboard, l->text + cur_col, (size_t) take);
-        clipboard[take] = '\0';
-        clip_len = take;
+        clip_take = (take > CLIP_MAX - 1) ? CLIP_MAX - 1 : take;
+        memcpy(clipboard, l->text + cur_col, (size_t) clip_take);
+        clipboard[clip_take] = '\0';
+        clip_len = clip_take;
         vim_yank_linewise = 0;
     }
+    return take;   /* chars actually on the line -- never cross into the next one */
 }
 
 /* Ctrl+w (Insert mode): delete the word before the cursor, shell-style -- skips any blanks immediately before the cursor, then the word/punct run before that. At the start of a line (nothing on this line to eat), it falls back to a plain Backspace, joining with the previous line like real vim does. */
@@ -3299,9 +3336,9 @@ int main(int argc, char **argv)
                 do_move(vim_apply_find);
             }
 
-            /* Count prefix: 1-9 always starts/extends it; 0 only continues one already started, so a bare 0 still falls through to the "start of line" motion further down. */
-            else if (lo >= '1' && lo <= '9') { vim_count = vim_count * 10 + (lo - '0'); }
-            else if (lo == '0' && vim_count > 0) { vim_count = vim_count * 10; }
+            /* Count prefix: 1-9 always starts/extends it; 0 only continues one already started, so a bare 0 still falls through to the "start of line" motion further down. Capped at VIM_COUNT_MAX before multiplying, since int is 16-bit here and an uncapped count overflows after 5 digits. */
+            else if (lo >= '1' && lo <= '9') { vim_count = (vim_count > VIM_COUNT_MAX / 10) ? VIM_COUNT_MAX : vim_count * 10 + (lo - '0'); }
+            else if (lo == '0' && vim_count > 0) { vim_count = (vim_count > VIM_COUNT_MAX / 10) ? VIM_COUNT_MAX : vim_count * 10; }
 
             else if (lo == 27) {
                 /* No macros, so Esc's only job here is cancelling Visual -- this pre-empts the plain-selection Esc case further below since vim_mode && !vim_insert already matches lo!=0 first. */
@@ -3351,13 +3388,11 @@ int main(int argc, char **argv)
             /* Normal-mode 2-key: dd/yy/cc, dw/yw, d$, and starting a 3-key operator+object sequence. */
             else if (vim_pending == 'd' && lo == 'd') {
                 int n = vim_take_count(), r;
-                yank_lines(cur_line, n);
-                for (r = 0; r < n; r++) delete_current_line();
+                if (yank_lines(cur_line, n)) for (r = 0; r < n; r++) delete_current_line();
                 vim_pending = 0;
             }
             else if (vim_pending == 'y' && lo == 'y') {
-                yank_lines(cur_line, vim_take_count());
-                flash_status("Yanked.");
+                if (yank_lines(cur_line, vim_take_count())) flash_status("Yanked.");
                 vim_pending = 0;
             }
             else if (vim_pending == 'c' && lo == 'c') { vim_change_line(); vim_pending = 0; vim_count = 0; }
@@ -3423,7 +3458,7 @@ int main(int argc, char **argv)
 
             else if (lo == 'x') {
                 int n = vim_take_count(), r;
-                vim_delete_chars_yank(n);
+                n = vim_delete_chars_yank(n);
                 for (r = 0; r < n; r++) do_delete_forward();
                 vim_pending = 0;
             }
@@ -3444,7 +3479,7 @@ int main(int argc, char **argv)
             else if (lo == 'R' && !vim_visual) { vim_insert = 1; vim_replace = 1; vim_pending = 0; vim_count = 0; request_full_redraw(); }
             else if (lo == 's' && !vim_visual) {
                 int n = vim_take_count(), r;
-                vim_delete_chars_yank(n);
+                n = vim_delete_chars_yank(n);
                 for (r = 0; r < n; r++) do_delete_forward();
                 vim_insert = 1;
                 vim_pending = 0;
