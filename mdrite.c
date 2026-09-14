@@ -1706,7 +1706,7 @@ void render_rich_line(const char *text, int row, int seg_start, int seg_end,
 /* Status bar, laid out like a Neovim statusline: [NORMAL/INSERT] filename* | status msg | Rich 42% 17:6. The mode block only shows while vim_mode is on; everything on the right stays right-aligned. */
 void draw_status_bar(void)
 {
-    char left[SCREEN_COLS + 1];
+    char left[sizeof(filename) + sizeof(status_msg) + 16];
     char right[32];
     int col = 0, rlen, rcol, percent;
     const char *sel_tag = sel_active ? " Sel" : "";
