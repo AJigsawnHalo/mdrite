@@ -25,7 +25,13 @@
 #define CMDBAR_ROW    (SCREEN_ROWS - 1)
 #define TEXT_ROWS     (SCREEN_ROWS - 1)
 #define MAX_LINE_LEN  1024
-#define MAX_LINES     2000
+/* Each Line is ~1064 bytes (text + wrap cache), and the large-model DOS build
+   has at most 640K of conventional memory to allocate from -- realistically
+   ~530-580 lines. The old 2000 was unreachable: hitting it meant malloc had
+   already failed long before. Kept at 500 so the cap is a clean, predictable
+   limit rather than a signal that the heap is exhausted; the NULL guard in
+   new_line() is the backstop for the machines that can't even manage that. */
+#define MAX_LINES     500
 
 /* Max word-wrapped visual rows a single buffer line can occupy in Rich view. Used by Line's wrap cache below. */
 #define MAX_WRAP_ROWS 16
@@ -375,9 +381,14 @@ void set_cursor(int col, int row)
 
 /* ================= line management ================= */
 
+/* Returns NULL when the heap is exhausted -- every caller must check. In the
+   large-model DOS build a NULL Line* is 0000:0000, so dereferencing one writes
+   straight into the interrupt vector table; there is no safe "just carry on"
+   here. */
 Line *new_line(void)
 {
     Line *l = (Line *) malloc(sizeof(Line));
+    if (!l) return NULL;
     l->text[0] = '\0';
     l->len = 0;
     l->wrap_nstarts = 0;
@@ -396,6 +407,14 @@ void doc_reset(void)
     int i;
     for (i = 0; i < doc_count; i++) free(doc[i]);
     doc[0] = new_line();
+    if (!doc[0]) {
+        /* Nothing left to fall back on: the document is already freed and there
+           is no memory for even one line, so there is no state to return to. */
+        clear_screen(ATTR_NORMAL);
+        set_cursor(0, 0);
+        printf("mdrite: out of memory.\n");
+        exit(1);
+    }
     doc_count = 1;
     cur_line = cur_col = top_line = left_col = code_left_col = 0;
     modified = 0;
@@ -522,8 +541,14 @@ int sel_delete(void)
     } else {
         Line *startl = doc[sl];
         Line *endl = doc[el];
-        int suffix_len = endl->len - ec;
+        int suffix_len;
         int shift;
+        /* Defensive: a stale anchor past the end line's length would make
+           suffix_len negative, which slips through the length guard below and
+           then walks strcat off the end of the buffer. */
+        if (ec > endl->len) ec = endl->len;
+        if (sc > startl->len) sc = startl->len;
+        suffix_len = endl->len - ec;
         if (sc + suffix_len > MAX_LINE_LEN) {
             flash_error("Selection too long to delete across lines.");
             sel_clear();
@@ -651,8 +676,9 @@ int split_line(void)
     Line *l = doc[cur_line];
     Line *nl;
     if (doc_count >= MAX_LINES) { flash_error("Document full."); return 0; }
-    sel_clear();
     nl = new_line();
+    if (!nl) { flash_error("Out of memory."); return 0; }
+    sel_clear();
     strcpy(nl->text, l->text + cur_col);
     nl->len = l->len - cur_col;
     l->text[cur_col] = '\0';
@@ -798,9 +824,74 @@ int list_indent_of(const char *text, int len)
     return list_marker_of(text, len, NULL, NULL);
 }
 
+/* True if text[pos] is preceded by an odd (i.e. unescaped-to-escaped) run of backslashes,
+   meaning a backslash actually escapes it -- "\\*" is a literal backslash then an active '*',
+   but "\*" is an escaped, literal '*'. */
+int is_escaped(const char *text, int pos)
+{
+    int n = 0, p = pos - 1;
+    while (p >= 0 && text[p] == '\\') { n++; p--; }
+    return n % 2 == 1;
+}
+
+/* Characters '\' can escape to render literally instead of as markup. */
+int is_escapable_char(char c)
+{
+    return c == '*' || c == '`' || c == '~' || c == '[' || c == ']' || c == '\\';
+}
+
+/* Checks for a matching closing delimiter later in the line (dlen==1 for '*'/'`', dlen==2 for '**'/'~~'). Escaped occurrences don't count as closers. */
+int has_closer(const char *text, int len, int i, int dlen)
+{
+    char ch = text[i];
+    int j = i + dlen;
+    /* A failed '**' pair shouldn't have its second star mistaken for a lone italic closer. */
+    if (dlen == 1 && ch == '*' && j < len && text[j] == '*') j++;
+    while (j < len) {
+        if (dlen == 2) {
+            if (text[j] == ch && j + 1 < len && text[j + 1] == ch && !is_escaped(text, j)) return 1;
+        } else {
+            if (text[j] == ch && !is_escaped(text, j)) return 1;
+        }
+        j++;
+    }
+    return 0;
+}
+
+/* Decides whether text[i] is an active markup toggle (hidden in Rich view) or just a literal
+   character, using the same rule render_rich_line's inline scanner applies. Returns the delimiter
+   width (1 or 2) and flips the matching bold/italic/code/strike flag when it toggles; returns
+   0 -- state unchanged -- when it's literal. Shared by rich_screen_col and build_screen_col_table
+   so cursor placement never disagrees with what's actually drawn (e.g. a '*' just typed with no
+   closer yet is a literal character, not a hidden delimiter that swallows the cursor). An open
+   code span takes priority over every other marker -- only its own closing backtick means
+   anything while *code is set, matching real Markdown's verbatim inline-code content. Callers
+   are expected to check for a backslash escape (see is_escapable_char) before calling this. */
+int inline_toggle_width(const char *text, int len, int i, int *bold, int *italic, int *code, int *strike)
+{
+    if (*code) {
+        if (text[i] == '`') { *code = 0; return 1; }
+        return 0;
+    }
+    if (text[i] == '*' && i + 1 < len && text[i + 1] == '*' && (*bold || has_closer(text, len, i, 2))) {
+        *bold = !*bold; return 2;
+    }
+    if (text[i] == '*' && (*italic || has_closer(text, len, i, 1))) {
+        *italic = !*italic; return 1;
+    }
+    if (text[i] == '`' && has_closer(text, len, i, 1)) {
+        *code = 1; return 1;
+    }
+    if (text[i] == '~' && i + 1 < len && text[i + 1] == '~' && (*strike || has_closer(text, len, i, 2))) {
+        *strike = !*strike; return 2;
+    }
+    return 0;
+}
+
 int rich_screen_col(const char *text, int raw_col, int in_code)
 {
     int i = 0, col = 0, len = (int) strlen(text);
+    int bold = 0, italic = 0, code = 0, strike = 0;
 
     if (raw_col > len) raw_col = len;
     if (in_code) return raw_col;   /* verbatim: no hiding, no markers */
@@ -841,11 +932,11 @@ int rich_screen_col(const char *text, int raw_col, int in_code)
     }
 
     while (i < raw_col && i < len) {
-        if (text[i] == '*' && i + 1 < len && text[i + 1] == '*') { i += 2; continue; }
-        if (text[i] == '*') { i++; continue; }
-        if (text[i] == '`') { i++; continue; }
-        if (text[i] == '~' && i + 1 < len && text[i + 1] == '~') { i += 2; continue; }
-        if (text[i] == '[') {
+        int width;
+        if (text[i] == '\\' && i + 1 < len && is_escapable_char(text[i + 1])) { i += 2; col++; continue; }
+        width = inline_toggle_width(text, len, i, &bold, &italic, &code, &strike);
+        if (width > 0) { i += width; continue; }
+        if (!code && text[i] == '[') {
             int j = i + 1;
             while (j < len && text[j] != ']') j++;
             if (j < len && j + 1 < len && text[j + 1] == '(') {
@@ -870,6 +961,7 @@ int build_screen_col_table(const char *text, int *table, int in_code)
 {
     int len = (int) strlen(text);
     int i, col;
+    int bold = 0, italic = 0, code = 0, strike = 0;
 
     if (in_code) {
         for (i = 0; i <= len; i++) table[i] = i;
@@ -922,15 +1014,18 @@ int build_screen_col_table(const char *text, int *table, int in_code)
 
     while (i < len) {
         int i_start = i;
-        if (text[i] == '*' && i + 1 < len && text[i + 1] == '*') {
-            i += 2;
-        } else if (text[i] == '*') {
-            i += 1;
-        } else if (text[i] == '`') {
-            i += 1;
-        } else if (text[i] == '~' && i + 1 < len && text[i + 1] == '~') {
-            i += 2;
-        } else if (text[i] == '[') {
+        int width;
+        if (text[i] == '\\' && i + 1 < len && is_escapable_char(text[i + 1])) {
+            table[i_start + 1] = col;      /* backslash hidden */
+            col++;
+            i = i_start + 2;
+            if (i <= len) table[i] = col;  /* escaped char is one ordinary column */
+            continue;
+        }
+        width = inline_toggle_width(text, len, i, &bold, &italic, &code, &strike);
+        if (width > 0) {
+            i += width;
+        } else if (!code && text[i] == '[') {
             int j = i_start + 1;
             while (j < len && text[j] != ']') j++;
             if (j < len && j + 1 < len && text[j + 1] == '(') {
@@ -1622,17 +1717,24 @@ void render_rich_line(const char *text, int row, int seg_start, int seg_end,
     if (seg_start > i) {
         int r = i;
         while (r < seg_start) {
-            if (text[r] == '*' && r + 1 < len && text[r + 1] == '*') { bold = !bold; r += 2; continue; }
-            if (text[r] == '*') { italic = !italic; r++; continue; }
-            if (text[r] == '`') { code = !code; r++; continue; }
-            if (text[r] == '~' && r + 1 < len && text[r + 1] == '~') { strike = !strike; r += 2; continue; }
-            if (text[r] == '[') {
-                int j = r + 1;
-                while (j < len && text[j] != ']') j++;
-                if (j < len && j + 1 < len && text[j + 1] == '(') {
-                    int k = j + 2;
-                    while (k < len && text[k] != ')') k++;
-                    if (k < len) { r = k + 1; continue; }
+            if (text[r] == '\\' && r + 1 < len && is_escapable_char(text[r + 1])) { r += 2; continue; }
+            if (code) {
+                if (text[r] == '`') { code = 0; r++; continue; }
+            } else {
+                if (text[r] == '*' && r + 1 < len && text[r + 1] == '*' &&
+                    (bold || has_closer(text, len, r, 2))) { bold = !bold; r += 2; continue; }
+                if (text[r] == '*' && (italic || has_closer(text, len, r, 1))) { italic = !italic; r++; continue; }
+                if (text[r] == '`' && has_closer(text, len, r, 1)) { code = 1; r++; continue; }
+                if (text[r] == '~' && r + 1 < len && text[r + 1] == '~' &&
+                    (strike || has_closer(text, len, r, 2))) { strike = !strike; r += 2; continue; }
+                if (text[r] == '[') {
+                    int j = r + 1;
+                    while (j < len && text[j] != ']') j++;
+                    if (j < len && j + 1 < len && text[j + 1] == '(') {
+                        int k = j + 2;
+                        while (k < len && text[k] != ')') k++;
+                        if (k < len) { r = k + 1; continue; }
+                    }
                 }
             }
             r++;
@@ -1642,47 +1744,62 @@ void render_rich_line(const char *text, int row, int seg_start, int seg_end,
     }
 
     while (i < len && i < seg_end) {
-        if (text[i] == '*' && i + 1 < len && text[i + 1] == '*') {
-            if (last_col >= 0 && sel_overlaps(i, i + 2, sel_start, sel_end))
-                rp[last_col] = CELL(last_ch, swap_attr(last_attr));
-            bold = !bold; i += 2; continue;
-        }
-        if (text[i] == '*') {
+        int is_esc = (text[i] == '\\' && i + 1 < len && is_escapable_char(text[i + 1]));
+        if (is_esc) {
             if (last_col >= 0 && sel_overlaps(i, i + 1, sel_start, sel_end))
                 rp[last_col] = CELL(last_ch, swap_attr(last_attr));
-            italic = !italic; i++; continue;
-        }
-        if (text[i] == '`') {
-            if (last_col >= 0 && sel_overlaps(i, i + 1, sel_start, sel_end))
-                rp[last_col] = CELL(last_ch, swap_attr(last_attr));
-            code = !code; i++; continue;
-        }
-        if (text[i] == '~' && i + 1 < len && text[i + 1] == '~') {
-            if (last_col >= 0 && sel_overlaps(i, i + 2, sel_start, sel_end))
-                rp[last_col] = CELL(last_ch, swap_attr(last_attr));
-            strike = !strike; i += 2; continue;
-        }
-        if (text[i] == '[') {
-            int j = i + 1;
-            while (j < len && text[j] != ']') j++;
-            if (j < len && j + 1 < len && text[j + 1] == '(') {
-                int k = j + 2;
-                while (k < len && text[k] != ')') k++;
-                if (k < len) {
-                    int m;
-                    if (last_col >= 0 && sel_overlaps(i, i + 1, sel_start, sel_end))
-                        rp[last_col] = CELL(last_ch, swap_attr(last_attr));  /* leading '[' */
-                    for (m = i + 1; m < j; m++) {
-                        if (col < SCREEN_COLS) {
-                            rp[col] = CELL(text[m], apply_sel(ATTR_LINK, m, sel_start, sel_end));
-                            last_col = col; last_ch = text[m]; last_attr = ATTR_LINK;
+            i++;   /* backslash hidden; text[i] is now the escaped char, drawn literally below */
+        } else if (code) {
+            if (text[i] == '`') {
+                if (last_col >= 0 && sel_overlaps(i, i + 1, sel_start, sel_end))
+                    rp[last_col] = CELL(last_ch, swap_attr(last_attr));
+                code = 0; i++; continue;
+            }
+        } else {
+            if (text[i] == '*' && i + 1 < len && text[i + 1] == '*' &&
+                (bold || has_closer(text, len, i, 2))) {
+                if (last_col >= 0 && sel_overlaps(i, i + 2, sel_start, sel_end))
+                    rp[last_col] = CELL(last_ch, swap_attr(last_attr));
+                bold = !bold; i += 2; continue;
+            }
+            if (text[i] == '*' && (italic || has_closer(text, len, i, 1))) {
+                if (last_col >= 0 && sel_overlaps(i, i + 1, sel_start, sel_end))
+                    rp[last_col] = CELL(last_ch, swap_attr(last_attr));
+                italic = !italic; i++; continue;
+            }
+            if (text[i] == '`' && has_closer(text, len, i, 1)) {
+                if (last_col >= 0 && sel_overlaps(i, i + 1, sel_start, sel_end))
+                    rp[last_col] = CELL(last_ch, swap_attr(last_attr));
+                code = 1; i++; continue;
+            }
+            if (text[i] == '~' && i + 1 < len && text[i + 1] == '~' &&
+                (strike || has_closer(text, len, i, 2))) {
+                if (last_col >= 0 && sel_overlaps(i, i + 2, sel_start, sel_end))
+                    rp[last_col] = CELL(last_ch, swap_attr(last_attr));
+                strike = !strike; i += 2; continue;
+            }
+            if (text[i] == '[') {
+                int j = i + 1;
+                while (j < len && text[j] != ']') j++;
+                if (j < len && j + 1 < len && text[j + 1] == '(') {
+                    int k = j + 2;
+                    while (k < len && text[k] != ')') k++;
+                    if (k < len) {
+                        int m;
+                        if (last_col >= 0 && sel_overlaps(i, i + 1, sel_start, sel_end))
+                            rp[last_col] = CELL(last_ch, swap_attr(last_attr));  /* leading '[' */
+                        for (m = i + 1; m < j; m++) {
+                            if (col < SCREEN_COLS) {
+                                rp[col] = CELL(text[m], apply_sel(ATTR_LINK, m, sel_start, sel_end));
+                                last_col = col; last_ch = text[m]; last_attr = ATTR_LINK;
+                            }
+                            col++;
                         }
-                        col++;
+                        if (last_col >= 0 && sel_overlaps(j, k + 1, sel_start, sel_end))
+                            rp[last_col] = CELL(last_ch, swap_attr(last_attr));  /* "](url)" */
+                        i = k + 1;
+                        continue;
                     }
-                    if (last_col >= 0 && sel_overlaps(j, k + 1, sel_start, sel_end))
-                        rp[last_col] = CELL(last_ch, swap_attr(last_attr));  /* "](url)" */
-                    i = k + 1;
-                    continue;
                 }
             }
         }
@@ -1987,6 +2104,7 @@ void load_file(const char *fname)
     int i;
     char *raw;
     int raw_len;
+    int truncated = 0;
     /* filename[] is a fixed 80 bytes. argv[1] from main() isn't length-checked like prompt_input()'s callers are, so check here too. */
     if (strlen(fname) >= sizeof(filename)) {
         flash_error("Filename too long.");
@@ -2007,6 +2125,7 @@ void load_file(const char *fname)
                 chunk = (k > pos) ? (k - pos) : MAX_LINE_LEN;
             }
             doc[doc_count] = new_line();
+            if (!doc[doc_count]) { truncated = 1; break; }
             memcpy(doc[doc_count]->text, raw + pos, chunk);
             doc[doc_count]->text[chunk] = '\0';
             doc[doc_count]->len = chunk;
@@ -2014,28 +2133,64 @@ void load_file(const char *fname)
             pos += chunk;
             while (pos < raw_len && raw[pos] == ' ') pos++;  /* drop the break space itself */
         } while (pos < raw_len && doc_count < MAX_LINES);
+        if (pos < raw_len) truncated = 1;   /* line didn't fit entirely */
         free(raw);
+        if (truncated) break;
     }
-    if (doc_count == 0) { doc[0] = new_line(); doc_count = 1; }
+    /* The loop above also stops when doc_count hits MAX_LINES; if anything is
+       still readable at that point the file is longer than the document can
+       hold. Checking for a readable byte distinguishes that from a clean EOF. */
+    if (!truncated && doc_count >= MAX_LINES && fgetc(f) != EOF) truncated = 1;
+    if (doc_count == 0) {
+        doc[0] = new_line();
+        if (!doc[0]) {
+            fclose(f);
+            clear_screen(ATTR_NORMAL);
+            set_cursor(0, 0);
+            printf("mdrite: out of memory.\n");
+            exit(1);
+        }
+        doc_count = 1;
+    }
     fclose(f);
-    strcpy(filename, fname);
     cur_line = cur_col = top_line = left_col = code_left_col = 0;
-    modified = 0;
     undo_line_no = -1;
     redo_line_no = -1;
     sel_clear();
     code_state_valid = 0;
     request_full_redraw();
-    flash_status("Loaded.");
+    if (truncated) {
+        /* Deliberately does NOT adopt the filename or clear `modified`: saving
+           now would write the partial document over the complete original, and
+           a reflexive Ctrl+S must not be able to do that silently. */
+        filename[0] = '\0';
+        modified = 1;
+        flash_error("File too large -- loaded partially. Save As to keep this, or quit without saving.");
+    } else {
+        strcpy(filename, fname);
+        modified = 0;
+        flash_status("Loaded.");
+    }
 }
 
 void save_file(const char *fname)
 {
     FILE *f = fopen(fname, "w");
-    int i;
+    int i, failed = 0;
     if (!f) { flash_error("Could not save file."); return; }
-    for (i = 0; i < doc_count; i++) fprintf(f, "%s\n", doc[i]->text);
-    fclose(f);
+    for (i = 0; i < doc_count; i++) {
+        if (fprintf(f, "%s\n", doc[i]->text) < 0) { failed = 1; break; }
+    }
+    /* fclose flushes, so a full disk often surfaces here rather than in
+       fprintf -- both have to be checked before claiming the save worked. */
+    if (fclose(f) != 0) failed = 1;
+    if (failed) {
+        /* fopen(..., "w") already truncated the target, so the on-disk copy is
+           incomplete. Leaving `modified` set keeps the quit guard armed and
+           lets the user retry elsewhere. */
+        flash_error("Write failed -- file on disk is incomplete. Try Save As to another disk.");
+        return;
+    }
     strcpy(filename, fname);
     modified = 0;
     flash_status("Saved.");
@@ -2707,6 +2862,17 @@ void vim_put_lines(int dir)
     while (nlines < count) {
         Line *nl = new_line();
         int len = 0;
+        if (!nl) {
+            /* Out of memory partway through. doc[] has already been shifted, so
+               the unfilled slots still hold stale copies of pointers that now
+               live further up -- close the gap instead of leaving them, or the
+               next edit double-frees them. */
+            memmove(&doc[insert_at + nlines], &doc[insert_at + count],
+                    (size_t) (doc_count - insert_at - count) * sizeof(Line *));
+            doc_count -= (count - nlines);
+            flash_error("Out of memory: paste incomplete.");
+            break;
+        }
         while (i < clip_len && clipboard[i] != '\n' && len < MAX_LINE_LEN) {
             nl->text[len++] = clipboard[i++];
         }
@@ -2798,9 +2964,14 @@ void vim_visual_case(int mode)
 /* 'O': open a new line above and enter Insert. No existing helper does this in reverse, so it's a small dedicated insert-a-blank-line-at-cur_line. */
 void vim_open_above(void)
 {
+    Line *nl;
     if (doc_count >= MAX_LINES) { flash_error("Document full."); return; }
+    /* Allocate before shifting doc[], so a failure leaves the array untouched
+       rather than opening a gap there's nothing to fill. */
+    nl = new_line();
+    if (!nl) { flash_error("Out of memory."); return; }
     memmove(&doc[cur_line + 1], &doc[cur_line], (size_t) (doc_count - cur_line) * sizeof(Line *));
-    doc[cur_line] = new_line();
+    doc[cur_line] = nl;
     doc_count++;
     cur_col = 0;
     modified = 1;
@@ -3186,6 +3357,7 @@ int main(int argc, char **argv)
     int key, lo, hi, k, matched;
 
     doc[0] = new_line();
+    if (!doc[0]) { printf("mdrite: out of memory.\n"); return 1; }
     if (argc > 1) load_file(argv[1]);
 
     clear_screen(ATTR_NORMAL);
