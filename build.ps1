@@ -19,11 +19,11 @@ try {
     $env:INCLUDE = "$root\h"
     $env:PATH    = "$root\BINNT64;$root\BINNT;$env:PATH"
 
-    $flags = if ($Debug) { '-d2' } else { '-d0', '-os' }
-    $srcs  = (Get-ChildItem *.c).Name
+	$flags = if ($Debug) { @('-d2') } else { @('-d0', '-os') }
+    $srcs  = @(Get-ChildItem *.c | ForEach-Object Name)
     New-Item build -ItemType Directory -Force | Out-Null
 
-    wcl -bt=dos -ml -0 -zq -wx @flags "-fe=$out" '-fo=build\' @srcs
+    wcl -bt=dos -ml -0 -wx @flags "-fe=$out" '-fo=build\' @srcs
     if ($LASTEXITCODE -ne 0) { throw "Build failed ($LASTEXITCODE)" }
     Write-Host "OK -> $out"
 }

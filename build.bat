@@ -13,7 +13,7 @@ set "FLAGS=-d0 -os"
 if /i "%1"=="debug" set "FLAGS=-d2"
 
 if not exist build mkdir build
-wcl -bt=dos -ml -0 -zq -wx %FLAGS% -fe=mdrite.exe -fo=build\ *.c
+wcl -bt=dos -ml -0 -wx %FLAGS% -fe=mdrite.exe -fo=build\ *.c
 if errorlevel 1 exit /b 1
 echo OK -^> mdrite.exe
 exit /b 0
